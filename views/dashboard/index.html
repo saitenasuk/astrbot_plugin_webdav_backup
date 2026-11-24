@@ -1,0 +1,96 @@
+<!doctype html>
+<!-- Rank the two destinations and their outcomes first, editable plans second, history third.
+     Save is the primary action. Use host surface/text/accent tokens and a 4/8/16/24/32 spacing scale. -->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>备份仪表盘</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>备份仪表盘</h1>
+        <p>管理本地与 WebDAV 备份，在 AstrBot 的备份列表中恢复。</p>
+      </header>
+      <p id="notice" role="status" aria-live="polite">正在读取备份状态…</p>
+      <section class="destinations" aria-label="备份目标" id="cards"></section>
+      <section class="panel" id="settings" hidden>
+        <h2>备份设置</h2>
+        <div role="group" aria-label="选择设置目标" class="switch">
+          <button type="button" data-mode="local" aria-pressed="true">
+            本地</button
+          ><button type="button" data-mode="webdav" aria-pressed="false">
+            WebDAV
+          </button>
+        </div>
+        <form id="form">
+          <fieldset>
+            <legend id="plan-title">本地计划</legend>
+            <label class="inline"
+              ><input type="checkbox" id="enabled" />启用定时备份</label
+            >
+            <div class="fields">
+              <label
+                >Cron 表达式<input
+                  type="text"
+                  id="cron"
+                  required
+                  aria-describedby="cron-help" /></label
+              ><label>时区<input type="text" id="timezone" required /></label>
+            </div>
+            <small id="cron-help"
+              >分、时、日、月、星期。例如 0 3 * * * 表示每天 03:00。</small
+            >
+          </fieldset>
+          <fieldset id="remote" hidden>
+            <legend>WebDAV 连接</legend>
+            <label
+              >现有目录地址<input
+                type="url"
+                id="url"
+                placeholder="https://dav.example.com/backups/"
+            /></label>
+            <div class="fields">
+              <label
+                >用户名<input
+                  type="text"
+                  id="username"
+                  autocomplete="off" /></label
+              ><label
+                >应用密码<input
+                  type="password"
+                  id="password"
+                  autocomplete="new-password"
+              /></label>
+            </div>
+            <label class="inline"
+              ><input type="checkbox" id="allow_http" />允许在可信内网使用明文
+              HTTP</label
+            >
+          </fieldset>
+          <fieldset>
+            <legend>备份内容</legend>
+            <p class="baseline">
+              <strong>主数据库 · 始终包含</strong
+              ><br />会话、消息、人格和附件记录。AstrBot 原生导入需要完整主库。
+            </p>
+            <div id="items" class="items"></div>
+          </fieldset>
+          <div class="footer">
+            <span id="dirty" role="status"></span
+            ><button id="save" class="primary" type="submit">
+              保存本地设置
+            </button>
+          </div>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>最近运行</h2>
+        <div id="history"><p>正在读取…</p></div>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

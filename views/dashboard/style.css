@@ -1,0 +1,236 @@
+:root {
+  --ink: var(--astrbot-color-text, CanvasText);
+  --muted: var(--astrbot-color-text-secondary, GrayText);
+  --line: var(--astrbot-color-border, #b6bcc3);
+  --surface: var(--astrbot-color-surface, Canvas);
+  --accent: var(--astrbot-color-primary, #215d76);
+  --on-accent: var(--astrbot-color-on-primary, white);
+  font:
+    16px/1.55 Inter,
+    Roboto,
+    system-ui,
+    sans-serif;
+  color: var(--ink);
+  background: var(--astrbot-color-background, Canvas);
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+main {
+  max-width: 1080px;
+  margin: auto;
+  padding: 32px 24px 48px;
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+h1 {
+  font-size: clamp(26px, 4vw, 36px);
+  line-height: 1.2;
+}
+h2 {
+  font-size: 21px;
+  margin-bottom: 16px;
+}
+h3,
+legend {
+  font-size: 17px;
+  font-weight: 650;
+}
+header p,
+small,
+.secondary,
+.item small,
+#dirty {
+  color: var(--muted);
+}
+header p {
+  margin-top: 8px;
+}
+#notice {
+  margin: 12px 0;
+  min-height: 1.55em;
+}
+#notice.error {
+  color: var(--astrbot-color-error, #a12929);
+}
+.destinations,
+.fields,
+.items {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.panel,
+.card {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 24px;
+}
+.panel {
+  margin-top: 24px;
+}
+.cardhead,
+.footer,
+.run {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.state {
+  font-size: 14px;
+  font-weight: 600;
+}
+.metric {
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+  margin: 12px 0 4px;
+}
+.card button {
+  margin-top: 16px;
+}
+button {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  border-radius: 7px;
+  padding: 8px 14px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.primary,
+.switch [aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.switch {
+  display: inline-flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.switch [aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--surface);
+  border-color: var(--ink);
+}
+fieldset {
+  border: 0;
+  margin: 20px 0 0;
+  padding: 0;
+  min-width: 0;
+}
+legend {
+  padding: 0;
+  margin-bottom: 8px;
+}
+label {
+  display: block;
+}
+.inline,
+.item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+.inline {
+  margin: 8px 0;
+}
+input[type="checkbox"] {
+  margin: 5px 0 0;
+  width: 17px;
+  height: 17px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+input:not([type="checkbox"]) {
+  margin-top: 4px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  background: var(--surface);
+  font: inherit;
+}
+.fields {
+  margin: 8px 0;
+}
+.items {
+  gap: 14px 24px;
+}
+.item span,
+.item small {
+  display: block;
+}
+.baseline {
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  border-inline-start: 3px solid var(--accent);
+}
+.footer {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.run {
+  align-items: flex-start;
+  padding: 10px 0;
+}
+.run + .run {
+  border-top: 1px solid var(--line);
+}
+.run small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.run strong {
+  white-space: nowrap;
+}
+.empty {
+  color: var(--muted);
+}
+[hidden] {
+  display: none !important;
+}
+@media (max-width: 640px) {
+  main {
+    padding: 16px 12px 32px;
+  }
+  .panel,
+  .card {
+    padding: 16px;
+  }
+  .destinations,
+  .fields,
+  .items {
+    grid-template-columns: 1fr;
+  }
+  .destinations {
+    gap: 12px;
+  }
+  .panel {
+    margin-top: 16px;
+  }
+}
