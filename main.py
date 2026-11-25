@@ -5,10 +5,12 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from zipfile import ZipFile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from yarl import URL
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context, Star, StarTools
@@ -16,7 +18,7 @@ from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .archive import NAME, create_archive
-from .webdav import collection_url, upload
+from .webdav import WebDAVError, collection_url, upload
 
 SCHEMA = json.loads(Path(__file__).with_name("_conf_schema.json").read_text("utf-8"))
 MODES = ("local", "webdav")
@@ -44,6 +46,7 @@ class BackupDashboard(Star):
         for endpoint, method, handler in [
             ("dashboard", "GET", self.dashboard),
             ("settings", "POST", self.settings),
+            ("test-connection", "POST", self.test_connection),
             ("run", "POST", self.run_now),
         ]:
             context.register_web_api(
@@ -144,6 +147,67 @@ class BackupDashboard(Star):
         self._apply_plans()
         return json_response({"saved": True})
 
+    async def test_connection(self):
+        """Exercise a transfer using the current dashboard inputs without saving them.
+
+        Returns:
+            A JSON response confirming cleanup or describing the failed operation.
+        """
+        payload = await request.json(default=None)
+        keys = {"url", "username", "password", "allow_http"}
+        if (
+            not isinstance(payload, dict)
+            or "url" not in payload
+            or payload.keys() - keys
+        ):
+            return error_response("连接设置字段无效", status_code=400)
+        for key, value in payload.items():
+            if key == "allow_http":
+                if type(value) is not bool:
+                    return error_response("HTTP 开关无效", status_code=400)
+            elif not isinstance(value, str) or len(value) > 4096:
+                return error_response("连接设置值无效", status_code=400)
+        try:
+            collection = collection_url(
+                payload["url"], payload.get("allow_http", False)
+            )
+            username = payload.get("username", "")
+            env_password = os.getenv("ASTRBOT_WEBDAV_PASSWORD")
+            password = (
+                env_password
+                or payload.get("password")
+                or self.config.get("password", "")
+            )
+            if password and username and (env_password or not payload.get("password")):
+                # A draft endpoint must not receive credentials for a different server.
+                saved = self.config.get("url", "")
+                if (
+                    not saved
+                    or URL(collection_url(saved, True)).origin()
+                    != URL(collection).origin()
+                    or self.config.get("username", "") != username
+                ):
+                    return error_response(
+                        "地址或用户名已更改。请重新输入密码，使用环境变量密码时请先保存连接设置。",
+                        status_code=400,
+                    )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                path = Path(work) / f"astrbot_connection_test_{uuid4().hex}.zip"
+                with ZipFile(path, "w") as archive:
+                    archive.writestr("test.txt", "AstrBot WebDAV connection test")
+                await upload(path, collection, username, password, probe=True)
+            logger.info("WebDAV connection test completed for %s", collection)
+            return json_response({"verified": True})
+        except (WebDAVError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
+            logger.warning(
+                "WebDAV connection test failed for %s: %s", collection, reason
+            )
+            return error_response(reason, status_code=502)
+
     async def _scheduled(self, mode):
         self._enqueue(mode)
 
@@ -186,6 +250,15 @@ class BackupDashboard(Star):
                 name = (
                     f"astrbot_backup_{now:%Y%m%d_%H%M%S}_{mode}_{uuid4().hex[:12]}.zip"
                 )
+                if mode == "webdav":
+                    record["remote"] = collection + name
+                logger.info(
+                    "Starting %s backup %s (include_temp=%s, destination=%s)",
+                    mode,
+                    name,
+                    settings.get(f"{mode}_items", False),
+                    record.get("remote", backups),
+                )
                 with tempfile.TemporaryDirectory(
                     prefix=".backup-", dir=backups
                 ) as work:
@@ -200,10 +273,11 @@ class BackupDashboard(Star):
                         plugin_folder=Path(__file__).parent.name,
                     )
                     size = path.stat().st_size
+                    logger.info("Created %s archive %s (%d bytes)", mode, name, size)
                     if mode == "local":
                         path.replace(backups / name)
                     else:
-                        self.phases[mode] = "正在上传"
+                        self.phases[mode] = "正在上传并校验"
                         await upload(
                             path,
                             collection,
@@ -220,7 +294,12 @@ class BackupDashboard(Star):
                     else type(exc).__name__
                 )
                 record["error"] = reason
-                logger.error("%s backup failed: %s", mode, reason)
+                logger.error(
+                    "%s backup failed (destination=%s): %s",
+                    mode,
+                    record.get("remote", mode),
+                    reason,
+                )
             finally:
                 self.phases[mode] = "空闲"
                 self.history = [record, *self.history][:30]

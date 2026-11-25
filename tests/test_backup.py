@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 from aiohttp import web
@@ -18,6 +19,24 @@ from astrbot.core.knowledge_base.kb_db_sqlite import KBSQLiteDatabase
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 plugin = importlib.import_module(f'{ROOT.name}.main')
+
+
+def properties(href, size, status="200 OK"):
+    """Build a single-resource DAV multistatus response for the test server.
+
+    Args:
+        href: Resource identifier as reported by the server.
+        size: Reported file size in bytes.
+        status: HTTP status of the size property.
+
+    Returns:
+        HTTP 207 response containing the requested DAV property.
+    """
+    return web.Response(status=207, content_type="application/xml", text=(
+        f'<D:multistatus xmlns:D="DAV:"><D:response><D:href>{escape(href)}</D:href>'
+        f'<D:propstat><D:prop><D:getcontentlength>{size}</D:getcontentlength></D:prop>'
+        f'<D:status>HTTP/1.1 {status}</D:status></D:propstat></D:response></D:multistatus>'
+    ))
 
 
 class BackupTests(unittest.IsolatedAsyncioTestCase):
@@ -118,6 +137,9 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             path=remote/request.match_info['name']
             if request.method=='PUT':
                 path.write_bytes(await request.read()); return web.Response(status=201)
+            if request.method == 'PROPFIND':
+                self.assertEqual(request.headers['Depth'], '0')
+                return properties(request.path, path.stat().st_size)
             self.assertEqual(request.method,'MOVE')
             path.rename(remote/request.headers['Destination'].split('/')[-1]); return web.Response(status=201)
         app=web.Application(); app.router.add_route('*','/{name}',handle)
@@ -160,3 +182,101 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._backup('webdav')
         self.assertFalse(self.bot.history[0]['ok']);self.assertIn('403',self.bot.history[0]['error'])
         self.assertEqual(list((self.data/'backups').iterdir()),[])
+
+
+    async def test_false_webdav_success_is_rejected(self):
+        async def handle(request):
+            if request.method == 'PUT':
+                nonlocal size
+                size = len(await request.read())
+                return web.Response(status=201)
+            if request.method == 'MOVE':
+                return web.Response(status=204)
+            self.assertEqual(request.method, 'PROPFIND')
+            if fault == 'missing':
+                return web.Response(status=404)
+            if fault == 'html':
+                return web.Response(text='<html>Login</html>')
+            if fault == 'bad_xml':
+                return web.Response(status=207, text='<html>')
+            if fault == 'wrong_resource':
+                return properties('/different.zip', size)
+            if fault == 'prop_status':
+                return properties(request.path, size, '404 Not Found')
+            return properties(request.path, size - 1)
+
+        size = None
+        app = web.Application()
+        app.router.add_route('*', '/{name}', handle)
+        async with TestServer(app) as server:
+            self.config.update(url=str(server.make_url('/')), allow_http=True)
+            for fault, error in [('missing', 'HTTP 404'), ('html', 'HTTP 200'),
+                                 ('bad_xml', '文件属性'), ('wrong_resource', '未确认'),
+                                 ('prop_status', '未确认'), ('truncated', '大小不符')]:
+                with self.subTest(fault=fault):
+                    await self.bot._backup('webdav')
+                    record = self.bot.history[0]
+                    self.assertFalse(record['ok'], record)
+                    self.assertIn(error, record['error'])
+                    self.assertTrue(record['remote'].endswith('.zip'))
+                    self.assertEqual(json.loads(self.bot.history_file.read_text())[0], record)
+
+    async def test_probe_uses_draft_credentials_and_only_deletes_its_own_files(self):
+        methods = []
+        auth = []
+        files = {'keep.zip': b'existing'}
+        async def handle(request):
+            name = request.match_info['name']
+            methods.append(request.method)
+            auth.append(request.headers.get('Authorization'))
+            if request.method == 'PUT':
+                self.assertEqual(request.headers['If-None-Match'], '*')
+                if fault == 'exists':
+                    return web.Response(status=412)
+                files[name] = await request.read()
+            elif request.method == 'MOVE':
+                self.assertEqual(request.headers['Overwrite'], 'F')
+                if fault == 'move':
+                    return web.Response(status=403)
+                files[request.headers['Destination'].rsplit('/', 1)[1]] = files.pop(name)
+            elif request.method == 'PROPFIND':
+                return properties(request.raw_path, len(files[name]))
+            elif request.method == 'DELETE':
+                if fault == 'delete':
+                    return web.Response(status=403)
+                del files[name]
+            return web.Response(status=204)
+
+        app = web.Application()
+        app.router.add_route('*', '/draft/{folder}/{name}', handle)
+        async with TestServer(app) as server:
+            collection = str(server.make_url('/draft/空 格/'))
+            self.config.update(url=str(server.make_url('/saved/')), username='test', password='saved', allow_http=True)
+            previous = dict(self.config)
+            for fault, expected in [('ok', ['PUT','MOVE','PROPFIND','DELETE']), ('exists', ['PUT']),
+                                    ('move', ['PUT','MOVE','DELETE']), ('delete', ['PUT','MOVE','PROPFIND','DELETE'])]:
+                methods.clear()
+                with self.subTest(fault=fault):
+                    payload = dict(url=collection, username='test', allow_http=True, password='draft')
+                    with patch.object(plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))):
+                        result = await self.bot.test_connection()
+                    self.assertEqual(methods, expected)
+                    self.assertEqual(result.status_code, 200 if fault == 'ok' else 502)
+                    if fault != 'delete':
+                        self.assertEqual(files, {'keep.zip': b'existing'})
+                    else:
+                        self.assertIn('DELETE', json.loads(result.body)['message'])
+                    self.assertEqual(self.config, previous)
+                    self.assertEqual(self.bot.history, [])
+            self.assertEqual(set(auth), {'Basic dGVzdDpkcmFmdA=='})
+            payload = dict(url='https://elsewhere.invalid/', username='test')
+            with patch.object(plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))):
+                self.assertEqual((await self.bot.test_connection()).status_code, 400)
+            payload.update(url=collection, allow_http=True)
+            fault = 'ok'
+            for env, expected_auth in [('', 'Basic dGVzdDpzYXZlZA=='), ('env', 'Basic dGVzdDplbnY=')]:
+                with patch.dict(plugin.os.environ, ASTRBOT_WEBDAV_PASSWORD=env), patch.object(
+                    plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))
+                ):
+                    self.assertEqual((await self.bot.test_connection()).status_code, 200)
+                    self.assertEqual(auth[-1], expected_auth)
