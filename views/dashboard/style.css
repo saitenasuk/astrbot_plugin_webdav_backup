@@ -57,8 +57,7 @@ header p {
   margin: 12px 0;
   min-height: 1.55em;
 }
-#notice.error,
-#save-feedback[data-state="error"] {
+#notice.error {
   color: var(--astrbot-color-error, #a12929);
 }
 .destinations,
@@ -193,9 +192,37 @@ input:not([type="checkbox"]) {
 #save-feedback {
   overflow-wrap: anywhere;
 }
-#save-feedback[data-state="success"] {
+#save-toast {
+  position: fixed;
+  top: max(16px, env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  width: max-content;
+  max-width: min(32rem, calc(100% - 32px));
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+#save-toast:not(:empty) {
+  padding: 10px 18px;
   color: var(--ink);
+  background: var(--surface);
+  border-inline-start: 4px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 3px 16px rgb(0 0 0 / 24%);
   font-weight: 600;
+}
+#save-toast[data-state="error"] {
+  border-inline-start-color: var(--astrbot-color-error, #a12929);
+}
+@media (prefers-reduced-motion: no-preference) {
+  #save-toast:not(:empty) {
+    animation: toast-in 160ms ease-out;
+  }
+  @keyframes toast-in {
+    from { opacity: 0; translate: 0 -6px; }
+    to { opacity: 1; translate: 0 0; }
+  }
 }
 #save {
   flex-shrink: 0;

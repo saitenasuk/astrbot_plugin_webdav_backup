@@ -104,10 +104,17 @@ function collect() {
   }
   return values;
 }
-function saveFeedback(message, state = "idle") {
-  const feedback = el("save-feedback");
-  feedback.dataset.state = state;
-  feedback.textContent = message;
+let saveToastTimer;
+function showSaveToast(message, state) {
+  const toast = el("save-toast");
+  clearTimeout(saveToastTimer);
+  toast.dataset.state = state;
+  toast.textContent = message;
+  if (state !== "pending") {
+    saveToastTimer = setTimeout(() => {
+      toast.textContent = "";
+    }, state === "error" ? 8000 : 5000);
+  }
 }
 function drawForm() {
   const conf = { ...model.settings, ...drafts[mode] };
@@ -128,7 +135,7 @@ function drawForm() {
     : "输入应用密码";
   el("allow_http").checked = conf.allow_http;
   el("include-temp").checked = conf[`${mode}_items`];
-  saveFeedback(drafts[mode] ? "有未保存的更改" : "");
+  el("save-feedback").textContent = drafts[mode] ? "有未保存的更改" : "";
 }
 async function refresh() {
   if (loading) return;
@@ -142,12 +149,12 @@ async function refresh() {
 }
 el("form").oninput = () => {
   drafts[mode] = collect();
-  saveFeedback("有未保存的更改");
+  el("save-feedback").textContent = "有未保存的更改";
 };
 el("form").addEventListener("invalid", (event) => {
   if (event.target === el("form").querySelector("input:invalid")) {
     const label = event.target.labels[0].textContent.trim();
-    saveFeedback(`请检查${label}。${event.target.validationMessage}`, "error");
+    showSaveToast(`请检查${label}。${event.target.validationMessage}`, "error");
   }
 }, true);
 for (const b of document.querySelectorAll("[data-mode]"))
@@ -164,7 +171,7 @@ el("form").onsubmit = async (event) => {
   busy = true;
   el("save").disabled = true;
   el("save").textContent = "正在保存…";
-  saveFeedback(`正在保存${names[mode]}设置…`);
+  showSaveToast(`正在保存${names[mode]}设置…`, "pending");
   for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
     control.disabled = true;
   try {
@@ -178,9 +185,9 @@ el("form").onsubmit = async (event) => {
     if (values.password) model.password_set = true;
     delete drafts[mode];
     drawForm();
-    saveFeedback(`${names[mode]}设置已保存`, "success");
+    showSaveToast(`${names[mode]}设置已保存`, "success");
   } catch (err) {
-    saveFeedback(`保存失败。${err.message || "请稍后重试。"}`, "error");
+    showSaveToast(`保存失败。${err.message || "请稍后重试。"}`, "error");
     return;
   } finally {
     busy = false;

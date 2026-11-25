@@ -1,7 +1,7 @@
 name: astrbot_plugin_webdav_backup
 display_name: 本地与 WebDAV 备份
 desc: 分别配置本地和 WebDAV 的备份范围与计划，在仪表盘查看运行结果，生成 AstrBot 原生 ZIP。
-version: v1.2.2
+version: v1.2.3
 author: saitenasuk
 repo: https://github.com/saitenasuk/astrbot_plugin_webdav_backup
 astrbot_version: ">=4.29.3,<5"
