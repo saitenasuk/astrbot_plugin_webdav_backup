@@ -1,17 +1,19 @@
 # AstrBot 本地与 WebDAV 备份
 
-分别设置本地和 WebDAV 的备份范围、执行时间和时区。两种任务都生成 AstrBot 原生 ZIP，由 AstrBot 自带的备份页面负责导入。
+本地备份收录下表中的所有常规项目，可额外包含 `temp` 目录。WebDAV 支持逐项选择，两种任务各自设置执行时间和时区。两种任务都生成 AstrBot 原生 ZIP，由 AstrBot 自带的备份页面负责导入。
 
 ## 安装和首次备份
 
 1. 在 AstrBot WebUI 的插件页选择通过仓库地址安装，粘贴 `https://github.com/saitenasuk/astrbot_plugin_webdav_backup`。
 2. 打开插件详情页的 **备份仪表盘**，选择「本地」或「WebDAV」。两个目标默认都跳过 `temp`，定时备份默认关闭。
-3. 选择备份项。需要定时执行时打开开关，填写五段 Cron 和 IANA 时区。默认本地每天 02:00，WebDAV 每天 03:00，时区均为 `Asia/Shanghai`。星期可写 `mon` 到 `sun`。
+3. 在本地设置中选择是否备份 `temp`，或在 WebDAV 设置中勾选所需项目。需要定时执行时打开开关，填写五段 Cron 和 IANA 时区。默认本地每天 02:00，WebDAV 每天 03:00，时区均为 `Asia/Shanghai`。星期可写 `mon` 到 `sun`。
 4. WebDAV 需要填写一个已存在的目录地址和有写入权限的账号。点击「保存」后，可用目标卡片中的「立即备份」验证。仪表盘显示排队、打包、上传、下次执行时间和最近 30 次结果。
 
 任务在 AstrBot 运行期间执行。两个目标同时触发时会排队，同一目标正在运行时会跳过重复触发。每次生成独立 ZIP，历史记录数只限制仪表盘显示，存储空间按实际保留的 ZIP 累计。
 
 ## 备份范围
+
+从 v1.0.0 升级时，原「本地备份项」中的 `temp` 勾选状态会自动转为新开关的状态。原先取消勾选的其他本地项目会随下次本地备份一起导出。
 
 | 项目 | 包含的内容 |
 | --- | --- |
@@ -19,11 +21,13 @@
 | 配置文件 | `cmd_config.json`、`mcp_server.json` 和 `data/config`。本插件导出的自身配置会移除 WebDAV 密码。 |
 | 知识库 | 元数据、文档块、FAISS 向量索引和媒体，与原生备份格式一致。 |
 | 附件文件 | 主库附件记录引用且仍存在的本地文件。仅备份主库时仍会保留附件记录。 |
-| 插件本体、插件数据、技能 | 三项可分别选择，对应 `data/plugins`、`data/plugin_data`、`data/skills`。 |
-| WebChat、文生图模板 | `data/webchat` 和 `data/t2i_templates`，可分别选择。 |
+| 插件本体、插件数据、技能 | 对应 `data/plugins`、`data/plugin_data`、`data/skills`。 |
+| WebChat、文生图模板 | `data/webchat` 和 `data/t2i_templates`。 |
 | 临时目录 `temp` | `data/temp` 下的临时媒体、下载件、语音等缓存。WebUI 维护页把日志、缓存与追踪列在同一组。日志和追踪库默认位于 `data/logs`。 |
 
 目录遍历跳过符号链接、`.git`、`__pycache__` 和 `.pyc`。运行期间数据库与文件可以继续变化，知识库批量导入等写入任务结束后生成的备份更适合迁移。
+
+[本地设置截图](docs/zh/local-backup.md) · [Local settings guide](docs/en/local-backup.md)
 
 ## 本地、WebDAV 与恢复
 

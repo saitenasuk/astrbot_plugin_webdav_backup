@@ -13,6 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from astrbot.core.backup.importer import AstrBotImporter
 from astrbot.core.db.sqlite import SQLiteDatabase
+from astrbot.core.knowledge_base.kb_db_sqlite import KBSQLiteDatabase
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
@@ -37,9 +38,13 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             def save_config(self, candidate):
                 self.update(candidate)
         self.config = Config({k:v['default'] for k,v in plugin.SCHEMA.items()})
-        self.config.update(local_items=['skills','config'],webdav_items=['temp'], password='private')
+        kb = KBSQLiteDatabase(str(self.data / 'knowledge_base/kb.db'))
+        await kb.initialize()
+        self.addAsyncCleanup(kb.engine.dispose)
+        self.kb_manager = SimpleNamespace(kb_db=kb, kb_insts={})
+        self.config.update(webdav_items=['temp'], password='private')
         with patch.object(plugin.StarTools,'get_data_dir',return_value=self.data):
-            self.bot=plugin.BackupDashboard(MagicMock(get_db=lambda:self.db,kb_manager=None),self.config)
+            self.bot=plugin.BackupDashboard(MagicMock(get_db=lambda:self.db,kb_manager=self.kb_manager),self.config)
         await self.bot.initialize()
         self.addAsyncCleanup(self.bot.terminate)
         data_patch=patch.object(plugin,'get_astrbot_data_path',return_value=str(self.data))
@@ -52,6 +57,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         backup, = (self.data/'backups').glob('*.zip')
         with ZipFile(backup) as z:
             self.assertEqual(z.testzip(),None)
+            self.assertIn('databases/kb_metadata.json', z.namelist())
             self.assertNotIn('directories/temp/media.jpg',z.namelist())
             self.assertNotIn(b'private',z.read(f'directories/config/{plugin.NAME}_config.json'))
             self.assertEqual(set(json.loads(z.read('manifest.json'))['directories']),{'config','skills'})
@@ -66,6 +72,39 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success,result.errors)
         self.assertEqual((await target.get_persona_by_id('backup-test')).system_prompt,'keep this prompt')
         self.assertEqual((dest/'skills/guide.md').read_text(),'keep')
+
+    async def test_local_scope_with_and_without_temp(self):
+        for name in ('plugins', 'plugin_data', 'webchat', 't2i_templates'):
+            (self.data / name).mkdir()
+            (self.data / name / 'example.txt').write_text(name)
+        directories = {'config', 'skills', 'plugins', 'plugin_data', 'webchat', 't2i_templates'}
+        (self.data / 'attachments').mkdir()
+        attachment = self.data / 'attachments' / 'sample.bin'
+        attachment.write_bytes(b'attachment contents')
+        await self.db.insert_attachment(str(attachment), 'file', 'application/octet-stream')
+        for include_temp in (True, False):
+            payload = SimpleNamespace(json=AsyncMock(return_value={'local_items': include_temp}))
+            with patch.object(plugin, 'request', payload):
+                self.assertEqual((await self.bot.settings()).status_code, 200)
+            self.assertEqual(self.config['webdav_items'], ['temp'])
+            await self.bot._backup('local')
+            record = self.bot.history[0]
+            self.assertTrue(record['ok'], record)
+            with ZipFile(self.data / 'backups' / record['name']) as archive:
+                manifest = json.loads(archive.read('manifest.json'))
+                self.assertEqual(set(manifest['directories']), directories | ({'temp'} if include_temp else set()))
+                self.assertEqual('directories/temp/media.jpg' in archive.namelist(), include_temp)
+                self.assertIn('databases/main_db.json', archive.namelist())
+                self.assertIn('databases/kb_metadata.json', archive.namelist())
+                self.assertTrue(any(name.startswith('files/attachments/') for name in archive.namelist()))
+
+    async def test_upgrade_keeps_previous_temp_choice(self):
+        for legacy in ([], ['skills'], ['temp', 'config']):
+            self.config['local_items'] = legacy
+            with patch.object(plugin.StarTools, 'get_data_dir', return_value=self.data):
+                plugin.BackupDashboard(MagicMock(), self.config)
+            self.assertIs(self.config['local_items'], 'temp' in legacy)
+            self.assertEqual(self.config['webdav_items'], ['temp'])
 
     async def test_webdav_put_move_and_independent_selection(self):
         remote=self.data/'remote'

@@ -25,6 +25,9 @@ MODES = ("local", "webdav")
 class BackupDashboard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        # Keep the original config key so AstrBot preserves its value during upgrades.
+        if isinstance(config.get("local_items"), list):
+            config.save_config({"local_items": "temp" in config["local_items"]})
         self.config = config
         self.scheduler = None
         self.tasks = {}
@@ -84,7 +87,7 @@ class BackupDashboard(Star):
             for key, spec in SCHEMA.items()
             if key != "password"
         }
-        options = SCHEMA["local_items"]
+        options = SCHEMA["webdav_items"]
         jobs = {
             job.id: job.next_run_time.isoformat()
             for job in self.scheduler.get_jobs()
@@ -190,9 +193,14 @@ class BackupDashboard(Star):
             record = {"mode": mode, "time": now.isoformat(), "ok": False}
             try:
                 settings = dict(self.config)
-                selected = set(
-                    settings.get(f"{mode}_items", SCHEMA[f"{mode}_items"]["default"])
-                )
+                if mode == "local":
+                    selected = set(SCHEMA["webdav_items"]["options"])
+                    if not settings.get("local_items", False):
+                        selected.discard("temp")
+                else:
+                    selected = set(
+                        settings.get("webdav_items", SCHEMA["webdav_items"]["default"])
+                    )
                 data = Path(get_astrbot_data_path())
                 backups = data / "backups"
                 backups.mkdir(parents=True, exist_ok=True)

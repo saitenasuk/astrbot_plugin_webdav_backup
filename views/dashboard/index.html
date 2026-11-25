@@ -72,7 +72,10 @@
           </fieldset>
           <fieldset>
             <legend>备份内容</legend>
-            <p class="baseline">
+            <p id="local-scope" class="baseline">
+              本地备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
+            </p>
+            <p id="webdav-scope" class="baseline" hidden>
               <strong>主数据库 · 始终包含</strong
               ><br />会话、消息、人格和附件记录。AstrBot 原生导入需要完整主库。
             </p>
