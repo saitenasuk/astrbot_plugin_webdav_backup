@@ -8,8 +8,10 @@ Both switches start off on a new installation. Upgrades preserve each destinatio
 
 ![Local backup settings](../images/local-settings.png)
 
-In the WebDAV settings, select **测试连接** (Test connection), to the left of Save. The test uses the current form values to write, rename, verify and delete a small ZIP in the target directory. Save the settings to use them for manual and scheduled backups.
+The former directory URL (WebDAV 目录地址 / 现有目录地址) is now the WebDAV service URL (WebDAV 服务地址). Upgrades keep its value. Remote directory (远程目录) defaults to `/`, meaning the service root. A service URL of `https://dav.example.com/dav/` and a remote directory of `/backups` target the existing `/dav/backups/` collection.
 
-If you cannot find an archive, compare the remote target shown in Recent runs with the directory you are browsing. Filter the AstrBot logs by the ZIP filename to see the HTTP status of the write (`PUT`), rename (`MOVE`) and verification (`PROPFIND`). If the log says `checking parent collection`, the plugin is looking up the exact ZIP path and size in the parent directory listing. `WebDAV verified` confirms the check. The connection test then deletes its test file. A verified run means the server reported the expected byte count at the final path. Older successful runs are labeled as unverified.
+In the WebDAV settings, select **测试连接** (Test connection), to the left of Save. The test uses the current form values to write, verify and delete a small ZIP in the target directory. Save the settings to use them for manual and scheduled backups.
+
+If you cannot find an archive, compare the remote target shown in Recent runs with the directory you are browsing. Filter the AstrBot logs by the ZIP filename to see the HTTP status of the final ZIP upload (`PUT`) and verification (`PROPFIND`). If the log says `checking parent collection`, the plugin is looking up the exact ZIP path and size in the parent directory listing. `WebDAV verified` confirms the check. The connection test then deletes its test file. A verified run means the server reported the expected byte count at the final path. Older successful runs are labeled as unverified.
 
 ![WebDAV backup settings](../images/webdav-settings.png)

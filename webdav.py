@@ -3,7 +3,7 @@ from base64 import b64encode
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import monotonic
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import aiohttp
 from defusedxml import ElementTree
@@ -17,12 +17,13 @@ class WebDAVError(RuntimeError):
     """A transfer failure with a diagnostic safe to display in the dashboard."""
 
 
-def collection_url(value: str, allow_http: bool) -> str:
+def collection_url(value: str, allow_http: bool, remote_dir: str = "/") -> str:
     """Validate a user-configured WebDAV collection URL before sending credentials.
 
     Args:
-        value: Address of an existing WebDAV directory.
+        value: WebDAV service address, including its mount path.
         allow_http: Allow cleartext transport on a trusted network.
+        remote_dir: Directory relative to the service root, using unescaped path segments.
 
     Returns:
         Collection URL with a trailing slash.
@@ -30,7 +31,7 @@ def collection_url(value: str, allow_http: bool) -> str:
     Raises:
         ValueError: If the address is unsuitable for sending credentials.
     """
-    message = "请填写 WebDAV 目录地址，使用 HTTPS，并在单独字段中填写账号和密码"
+    message = "请填写 WebDAV 服务地址，使用 HTTPS，并在单独字段中填写账号和密码"
     try:
         url = URL(value.strip())
         if (
@@ -42,9 +43,27 @@ def collection_url(value: str, allow_http: bool) -> str:
             or url.fragment
         ):
             raise ValueError(message)
-        return str(url).rstrip("/") + "/"
     except ValueError as exc:
         raise ValueError(message) from exc
+    directory = remote_dir.strip()
+    parts = [part for part in directory.split("/") if part]
+    if (
+        directory.startswith("//")
+        or "://" in directory
+        or any(
+            unquote(part) in (".", "..")
+            or "/" in unquote(part)
+            or "\\" in unquote(part)
+            or any(ord(c) < 32 for c in part)
+            for part in parts
+        )
+    ):
+        raise ValueError("请填写服务地址下的远程目录，例如 / 或 /backups")
+    return (
+        str(url).rstrip("/")
+        + "/"
+        + "".join(quote(part, safe="") + "/" for part in parts)
+    )
 
 
 @asynccontextmanager
@@ -140,7 +159,7 @@ async def _verify(session, final, size):
 
     Args:
         session: Authenticated HTTP client.
-        final: Expected URL after MOVE.
+        final: URL used for the upload.
         size: Byte length of the local archive.
 
     Raises:
@@ -181,11 +200,11 @@ async def _verify(session, final, size):
             ValueError,
         ) as exc:
             raise WebDAVError(
-                "WebDAV PROPFIND 未返回有效的文件属性，请检查 WebDAV 目录地址"
+                "WebDAV PROPFIND 未返回有效的文件属性，请检查 WebDAV 服务地址"
             ) from exc
         if root.tag != "{DAV:}multistatus":
             raise WebDAVError(
-                "WebDAV PROPFIND 缺少 DAV multistatus，请检查 WebDAV 目录地址"
+                "WebDAV PROPFIND 缺少 DAV multistatus，请检查 WebDAV 服务地址"
             )
         reported, reason = _reported_size(root, URL(url), target)
         if reported is not None:
@@ -212,7 +231,7 @@ async def _verify(session, final, size):
 async def upload(
     path: Path, collection: str, username: str, password: str, *, probe: bool = False
 ) -> None:
-    """Upload, rename and verify an archive, removing the final file for a probe.
+    """Upload and verify a uniquely named archive, removing it after a probe.
 
     Args:
         path: Local archive with a unique filename.
@@ -225,7 +244,6 @@ async def upload(
         WebDAVError: If the transfer, verification or probe cleanup fails.
     """
     final = collection + quote(path.name, safe="")
-    partial = final + ".partial"
     size = path.stat().st_size
     headers = {}
     if username:
@@ -237,35 +255,25 @@ async def upload(
         sock_read=8 if probe else 300,
     )
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        cleanup = None
-        try:
-            with path.open("rb") as file:
-                async with _request(
-                    session,
-                    "PUT",
-                    partial,
-                    (200, 201, 204),
-                    data=file,
-                    headers={"Content-Type": "application/zip", "If-None-Match": "*"},
-                ):
-                    cleanup = partial
+        with path.open("rb") as file:
             async with _request(
                 session,
-                "MOVE",
-                partial,
+                "PUT",
+                final,
                 (200, 201, 204),
-                headers={"Destination": final, "Overwrite": "F"},
+                data=file,
+                headers={"Content-Type": "application/zip", "If-None-Match": "*"},
             ):
-                cleanup = final if probe else None
+                pass
+        try:
             await _verify(session, final, size)
         except (Exception, asyncio.CancelledError):
-            # Only clean a name we successfully created. Keep real final archives for inspection.
-            if cleanup:
+            if probe:
                 try:
-                    async with _request(session, "DELETE", cleanup, (200, 204, 404)):
+                    async with _request(session, "DELETE", final, (200, 204, 404)):
                         pass
                 except WebDAVError as exc:
-                    logger.warning("WebDAV cleanup failed for %s: %s", cleanup, exc)
+                    logger.warning("WebDAV cleanup failed for %s: %s", final, exc)
             raise
         if probe:
             async with _request(session, "DELETE", final, (200, 204)):

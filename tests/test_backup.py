@@ -69,6 +69,16 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         data_patch=patch.object(plugin,'get_astrbot_data_path',return_value=str(self.data))
         data_patch.start(); self.addCleanup(data_patch.stop)
 
+    def test_service_and_remote_directory(self):
+        service = 'https://example.org/mount/dav/'
+        self.assertEqual(plugin.collection_url(service, False), service)
+        self.assertEqual(plugin.collection_url(service, False, '/'), service)
+        self.assertEqual(plugin.collection_url(service, False, '/my backups/知识/'),
+                         service + 'my%20backups/%E7%9F%A5%E8%AF%86/')
+        for outside in ('/../elsewhere', '//other.example', 'https://other.example', '/%2e%2e', '/a%2fb'):
+            with self.subTest(outside=outside), self.assertRaises(ValueError):
+                plugin.collection_url(service, False, outside)
+
     async def test_local_native_restore(self):
         self.assertTrue(self.bot._enqueue('local'))
         self.assertFalse(self.bot._enqueue('local'))
@@ -130,7 +140,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(self.config['local_items'], expected[0])
             self.assertIs(self.config['webdav_items'], expected[1])
 
-    async def test_webdav_put_move_and_independent_selection(self):
+    async def test_webdav_direct_put_and_independent_selection(self):
         remote=self.data/'remote'
         async def handle(request):
             self.assertIsNotNone(request.headers.get('Authorization'))
@@ -140,14 +150,13 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             if request.method == 'PROPFIND':
                 self.assertEqual(request.headers['Depth'], '0')
                 return properties(request.path, path.stat().st_size)
-            self.assertEqual(request.method,'MOVE')
-            path.rename(remote/request.headers['Destination'].split('/')[-1]); return web.Response(status=201)
-        app=web.Application(); app.router.add_route('*','/{name}',handle)
+            self.fail(f'Unexpected WebDAV method: {request.method}')
+        app=web.Application(); app.router.add_route('*','/mount/dav/backups/{name}',handle)
         async with TestServer(app) as server:
-            self.config.update(url=str(server.make_url('/')),username='backup',allow_http=True)
+            self.config.update(url=str(server.make_url('/mount/dav/')), username='backup', allow_http=True)
             for include_temp in (True, False):
                 self.config['local_items'] = not include_temp
-                payload = SimpleNamespace(json=AsyncMock(return_value={'webdav_items': include_temp}))
+                payload = SimpleNamespace(json=AsyncMock(return_value={'webdav_items': include_temp, 'remote_dir': '/backups'}))
                 with patch.object(plugin, 'request', payload):
                     self.assertEqual((await self.bot.settings()).status_code, 200)
                 for mode in plugin.MODES:
@@ -190,8 +199,6 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                 nonlocal size
                 size = len(await request.read())
                 return web.Response(status=201)
-            if request.method == 'MOVE':
-                return web.Response(status=204)
             self.assertEqual(request.method, 'PROPFIND')
             if request.path == '/':
                 self.assertIn(fault, ('wrong_resource', 'prop_status'))
@@ -235,8 +242,6 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             methods.append((request.method, request.headers.get('Depth')))
             if request.method == 'PUT':
                 files[name] = await request.read()
-            elif request.method == 'MOVE':
-                files[name.removesuffix('.partial')] = files.pop(name)
             elif request.method == 'DELETE':
                 del files[name]
             elif name:
@@ -268,7 +273,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                     payload = {'url': self.config['url'], 'allow_http': True}
                     with patch.object(plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))):
                         result = await self.bot.test_connection()
-                    self.assertEqual(methods, [('PUT', None), ('MOVE', None), ('PROPFIND', '0'),
+                    self.assertEqual(methods, [('PUT', None), ('PROPFIND', '0'),
                                                ('PROPFIND', '1'), ('DELETE', None)])
                     self.assertFalse(files)
                     self.assertEqual(result.status_code, 502 if error else 200)
@@ -294,12 +299,9 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                 if fault == 'exists':
                     return web.Response(status=412)
                 files[name] = await request.read()
-            elif request.method == 'MOVE':
-                self.assertEqual(request.headers['Overwrite'], 'F')
-                if fault == 'move':
-                    return web.Response(status=403)
-                files[request.headers['Destination'].rsplit('/', 1)[1]] = files.pop(name)
             elif request.method == 'PROPFIND':
+                if fault == 'verify':
+                    return web.Response(status=403)
                 return properties(request.raw_path, len(files[name]))
             elif request.method == 'DELETE':
                 if fault == 'delete':
@@ -310,14 +312,14 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_route('*', '/draft/{folder}/{name}', handle)
         async with TestServer(app) as server:
-            collection = str(server.make_url('/draft/空 格/'))
+            collection = str(server.make_url('/draft/'))
             self.config.update(url=str(server.make_url('/saved/')), username='test', password='saved', allow_http=True)
             previous = dict(self.config)
-            for fault, expected in [('ok', ['PUT','MOVE','PROPFIND','DELETE']), ('exists', ['PUT']),
-                                    ('move', ['PUT','MOVE','DELETE']), ('delete', ['PUT','MOVE','PROPFIND','DELETE'])]:
+            for fault, expected in [('ok', ['PUT','PROPFIND','DELETE']), ('exists', ['PUT']),
+                                    ('verify', ['PUT','PROPFIND','DELETE']), ('delete', ['PUT','PROPFIND','DELETE'])]:
                 methods.clear()
                 with self.subTest(fault=fault):
-                    payload = dict(url=collection, username='test', allow_http=True, password='draft')
+                    payload = dict(url=collection, remote_dir='/空 格', username='test', allow_http=True, password='draft')
                     with patch.object(plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))):
                         result = await self.bot.test_connection()
                     self.assertEqual(methods, expected)
@@ -332,7 +334,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             payload = dict(url='https://elsewhere.invalid/', username='test')
             with patch.object(plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))):
                 self.assertEqual((await self.bot.test_connection()).status_code, 400)
-            payload.update(url=collection, allow_http=True)
+            payload.update(url=collection, remote_dir='/空 格', allow_http=True)
             fault = 'ok'
             for env, expected_auth in [('', 'Basic dGVzdDpzYXZlZA=='), ('env', 'Basic dGVzdDplbnY=')]:
                 with patch.dict(plugin.os.environ, ASTRBOT_WEBDAV_PASSWORD=env), patch.object(
