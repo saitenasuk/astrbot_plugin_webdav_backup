@@ -140,7 +140,9 @@ class BackupDashboard(Star):
                 except (ValueError, ZoneInfoNotFoundError) as exc:
                     raise ValueError("请检查五段 Cron 表达式与 IANA 时区") from exc
             if candidate["url"] or candidate["webdav_enabled"]:
-                collection_url(candidate["url"], candidate["allow_http"])
+                collection_url(
+                    candidate["url"], candidate["allow_http"], candidate["remote_dir"]
+                )
         except ValueError as exc:
             return error_response(str(exc), status_code=400)
         self.config.save_config(candidate)
@@ -154,7 +156,7 @@ class BackupDashboard(Star):
             A JSON response confirming cleanup or describing the failed operation.
         """
         payload = await request.json(default=None)
-        keys = {"url", "username", "password", "allow_http"}
+        keys = {"url", "remote_dir", "username", "password", "allow_http"}
         if (
             not isinstance(payload, dict)
             or "url" not in payload
@@ -169,7 +171,9 @@ class BackupDashboard(Star):
                 return error_response("连接设置值无效", status_code=400)
         try:
             collection = collection_url(
-                payload["url"], payload.get("allow_http", False)
+                payload["url"],
+                payload.get("allow_http", False),
+                payload.get("remote_dir", "/"),
             )
             username = payload.get("username", "")
             env_password = os.getenv("ASTRBOT_WEBDAV_PASSWORD")
@@ -226,7 +230,9 @@ class BackupDashboard(Star):
         if mode == "webdav":
             try:
                 collection_url(
-                    self.config.get("url", ""), self.config.get("allow_http", False)
+                    self.config.get("url", ""),
+                    self.config.get("allow_http", False),
+                    self.config.get("remote_dir", "/"),
                 )
             except ValueError as exc:
                 return error_response(str(exc), status_code=400)
@@ -245,7 +251,9 @@ class BackupDashboard(Star):
                 backups.mkdir(parents=True, exist_ok=True)
                 if mode == "webdav":
                     collection = collection_url(
-                        settings.get("url", ""), settings.get("allow_http", False)
+                        settings.get("url", ""),
+                        settings.get("allow_http", False),
+                        settings.get("remote_dir", "/"),
                     )
                 name = (
                     f"astrbot_backup_{now:%Y%m%d_%H%M%S}_{mode}_{uuid4().hex[:12]}.zip"

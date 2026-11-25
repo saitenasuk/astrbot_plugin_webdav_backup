@@ -101,7 +101,7 @@ function collect() {
       key === "enabled" ? el(key).checked : el(key).value.trim();
   values[`${mode}_items`] = el("include-temp").checked;
   if (mode === "webdav") {
-    for (const key of ["url", "username"]) values[key] = el(key).value.trim();
+    for (const key of ["url", "remote_dir", "username"]) values[key] = el(key).value.trim();
     values.allow_http = el("allow_http").checked;
     if (el("password").value) values.password = el("password").value;
   }
@@ -132,7 +132,7 @@ function drawForm() {
   el("test-connection").hidden = mode !== "webdav";
   el("remote").hidden = mode !== "webdav";
   el("remote").disabled = mode !== "webdav";
-  for (const key of ["url", "username", "password"])
+  for (const key of ["url", "remote_dir", "username", "password"])
     el(key).value = conf[key] || "";
   el("password").placeholder = model.password_set
     ? "已设置，留空保留"
@@ -174,7 +174,7 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
   const testing = event.currentTarget === el("test-connection");
   const values = collect();
   if (testing && (!values.url || !el("url").validity.valid)) {
-    showSaveToast("请填写有效的 WebDAV 目录地址。", "error");
+    showSaveToast("请填写有效的 WebDAV 服务地址。", "error");
     el("url").focus();
     return;
   }
@@ -192,8 +192,8 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
     control.disabled = true;
   try {
     if (testing) {
-      const {url, username, password, allow_http} = values;
-      await bridge.apiPost("test-connection", {url, username, password, allow_http});
+      const {url, remote_dir, username, password, allow_http} = values;
+      await bridge.apiPost("test-connection", {url, remote_dir, username, password, allow_http});
       showSaveToast("连接成功，测试文件已写入、校验并删除。", "success");
       return;
     }

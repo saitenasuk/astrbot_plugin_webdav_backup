@@ -43,8 +43,15 @@
   },
   "url": {
     "type": "string",
-    "description": "WebDAV 目录地址",
+    "description": "WebDAV 服务地址",
+    "hint": "包含 WebDAV 入口，例如 https://dav.example.com/dav/。",
     "default": ""
+  },
+  "remote_dir": {
+    "type": "string",
+    "description": "远程目录",
+    "hint": "相对于服务地址的现有目录。/ 表示服务根目录，例如 /backups 表示其子目录。",
+    "default": "/"
   },
   "username": {
     "type": "string",
