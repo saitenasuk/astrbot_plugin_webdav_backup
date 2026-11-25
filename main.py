@@ -216,15 +216,6 @@ class BackupDashboard(Star):
             )
             return error_response(reason, status_code=502)
 
-    def _save_history(self):
-        """Atomically save run outcomes and their most recent recheck receipts."""
-        try:
-            temp = self.history_file.with_suffix(".tmp")
-            temp.write_text(json.dumps(self.history, ensure_ascii=False), "utf-8")
-            temp.replace(self.history_file)
-        except OSError:
-            logger.warning("Could not persist backup history")
-
     async def verify_remote(self):
         """Recheck one recorded archive using the saved collection and credentials.
 
@@ -288,7 +279,12 @@ class BackupDashboard(Star):
                 check = {"ok": False, "error": str(exc)}
             check["time"] = datetime.now(timezone.utc).isoformat()
             record["recheck"] = check
-            self._save_history()
+            try:
+                temp = self.history_file.with_suffix(".tmp")
+                temp.write_text(json.dumps(self.history, ensure_ascii=False), "utf-8")
+                temp.replace(self.history_file)
+            except OSError:
+                logger.warning("Could not persist WebDAV recheck history")
             return json_response(check)
 
     async def _scheduled(self, mode):
