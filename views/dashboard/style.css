@@ -224,8 +224,17 @@ input:not([type="checkbox"]) {
     to { opacity: 1; translate: 0 0; }
   }
 }
-#save {
-  flex-shrink: 0;
+.footer, .actions {
+  flex-wrap: wrap;
+}
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-inline-start: auto;
+  gap: 8px;
+}
+.run > div {
+  min-width: 0;
 }
 .run {
   align-items: flex-start;

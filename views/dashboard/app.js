@@ -72,10 +72,13 @@ function drawStatus() {
   const rows = model.history.map((r) => {
     const row = node("div", undefined, "run"),
       info = node("div");
+    const result = !r.ok ? "失败" : r.mode === "webdav"
+      ? (r.remote ? "成功（已校验）" : "成功（旧版未校验）") : "成功";
     info.append(
-      node("b", `${names[r.mode]} · ${r.ok ? "成功" : "失败"}`),
+      node("b", `${names[r.mode]} · ${result}`),
       node("small", `${time(r.time)} · ${r.ok ? r.name : r.error}`),
     );
+    if (r.remote) info.append(node("small", `远端目标：${r.remote}`));
     row.append(info, node("strong", r.ok ? bytes(r.size) : ""));
     return row;
   });
@@ -126,6 +129,7 @@ function drawForm() {
   el("enabled").checked = conf[`${mode}_enabled`];
   for (const key of ["cron", "timezone"])
     el(key).value = conf[`${mode}_${key}`];
+  el("test-connection").hidden = mode !== "webdav";
   el("remote").hidden = mode !== "webdav";
   el("remote").disabled = mode !== "webdav";
   for (const key of ["url", "username", "password"])
@@ -164,17 +168,35 @@ for (const b of document.querySelectorAll("[data-mode]"))
       drawForm();
     }
   };
-el("form").onsubmit = async (event) => {
+el("test-connection").onclick = el("form").onsubmit = async (event) => {
   event.preventDefault();
   if (busy) return;
+  const testing = event.currentTarget === el("test-connection");
   const values = collect();
+  if (testing && (!values.url || !el("url").validity.valid)) {
+    showSaveToast("请填写有效的 WebDAV 目录地址。", "error");
+    el("url").focus();
+    return;
+  }
   busy = true;
   el("save").disabled = true;
-  el("save").textContent = "正在保存…";
-  showSaveToast(`正在保存${names[mode]}设置…`, "pending");
+  el("test-connection").disabled = true;
+  if (testing) {
+    el("test-connection").textContent = "测试中…";
+    showSaveToast("正在测试 WebDAV 写入和校验…", "pending");
+  } else {
+    el("save").textContent = "正在保存…";
+    showSaveToast(`正在保存${names[mode]}设置…`, "pending");
+  }
   for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
     control.disabled = true;
   try {
+    if (testing) {
+      const {url, username, password, allow_http} = values;
+      await bridge.apiPost("test-connection", {url, username, password, allow_http});
+      showSaveToast("连接成功，测试文件已写入、校验并删除。", "success");
+      return;
+    }
     await bridge.apiPost("settings", values);
     Object.assign(
       model.settings,
@@ -187,13 +209,15 @@ el("form").onsubmit = async (event) => {
     drawForm();
     showSaveToast(`${names[mode]}设置已保存`, "success");
   } catch (err) {
-    showSaveToast(`保存失败。${err.message || "请稍后重试。"}`, "error");
+    showSaveToast(`${testing ? "连接测试" : "保存"}失败。${err.message || "请稍后重试。"}`, "error");
     return;
   } finally {
     busy = false;
     for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
       control.disabled = false;
     el("remote").disabled = mode !== "webdav";
+    el("test-connection").disabled = false;
+    el("test-connection").textContent = "测试连接";
     el("save").disabled = false;
     el("save").textContent = `保存${names[mode]}设置`;
   }
