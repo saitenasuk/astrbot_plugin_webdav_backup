@@ -12,6 +12,14 @@ The overview shows a destination’s latest failure alongside the last verified 
 
 To restore, retrieve the WebDAV ZIP and import it on AstrBot’s native backup page. The **如何恢复备份？** disclosure explains the steps and warns that importing replaces existing data.
 
+## Recheck an uploaded archive
+
+In **最近运行 (Recent runs)**, expand a successful WebDAV run with a recorded remote path and size, then select **复查远端文件 (Recheck remote file)**. This reads the ZIP properties, falling back to the parent listing when needed. Unlike Test connection, it never writes or deletes a file. The saved service and directory must still match the record. No ZIP is downloaded, and a match does not establish content integrity or restorability.
+
+The last actual recheck time and result are saved separately. A later 404 or size mismatch does not change the original upload outcome. New runs also show stage timings and total execution time (excluding time spent queued); failures identify the stage that stopped. Older records do not have timing estimates.
+
+![Stage timings and a read-only check result (sample record)](../images/remote-recheck.png)
+
 ## Destination settings
 
 Enable **备份 temp 目录** to include `data/temp` in manual and scheduled backups for that destination, then save. The note below the switch lists cached files, temporary images, audio and downloads.

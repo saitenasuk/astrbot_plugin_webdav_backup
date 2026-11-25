@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 from zipfile import ZipFile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,7 +20,7 @@ from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .archive import NAME, create_archive
-from .webdav import WebDAVError, collection_url, upload
+from .webdav import WebDAVError, collection_url, upload, verify_remote
 
 SCHEMA = json.loads(Path(__file__).with_name("_conf_schema.json").read_text("utf-8"))
 MODES = ("local", "webdav")
@@ -39,6 +41,7 @@ class BackupDashboard(Star):
         self.tasks = {}
         self.phases = dict.fromkeys(MODES, "空闲")
         self.lock = asyncio.Lock()
+        self.recheck_lock = asyncio.Lock()
         self.closing = False
         self.history = []
         self.plan_errors = {}
@@ -47,6 +50,7 @@ class BackupDashboard(Star):
             ("dashboard", "GET", self.dashboard),
             ("settings", "POST", self.settings),
             ("test-connection", "POST", self.test_connection),
+            ("verify-remote", "POST", self.verify_remote),
             ("run", "POST", self.run_now),
         ]:
             context.register_web_api(
@@ -212,6 +216,81 @@ class BackupDashboard(Star):
             )
             return error_response(reason, status_code=502)
 
+    def _save_history(self):
+        """Atomically save run outcomes and their most recent recheck receipts."""
+        try:
+            temp = self.history_file.with_suffix(".tmp")
+            temp.write_text(json.dumps(self.history, ensure_ascii=False), "utf-8")
+            temp.replace(self.history_file)
+        except OSError:
+            logger.warning("Could not persist backup history")
+
+    async def verify_remote(self):
+        """Recheck one recorded archive using the saved collection and credentials.
+
+        Returns:
+            A timestamped check result, or an error if no check was performed.
+        """
+        payload = await request.json(default=None)
+        if (
+            not isinstance(payload, dict)
+            or payload.keys() != {"time"}
+            or not isinstance(payload["time"], str)
+        ):
+            return error_response("请选择一条 WebDAV 备份记录", status_code=400)
+        record = next(
+            (
+                r
+                for r in self.history
+                if r.get("time") == payload["time"] and r.get("mode") == "webdav"
+            ),
+            None,
+        )
+        if not record:
+            return error_response("该 WebDAV 记录已不在运行历史中", status_code=404)
+        name, size = record.get("name"), record.get("size")
+        if not (
+            record.get("ok")
+            and record.get("remote")
+            and isinstance(name, str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]+\.zip", name)
+            and type(size) is int
+            and size >= 0
+        ):
+            return error_response("该记录没有可复查的远端 ZIP 回执", status_code=400)
+        try:
+            collection = collection_url(
+                self.config.get("url", ""),
+                self.config.get("allow_http", False),
+                self.config.get("remote_dir", "/"),
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        # Only the saved collection determines where credentials may be sent.
+        target = collection + name
+        if target != record["remote"]:
+            return error_response(
+                "当前 WebDAV 目标与历史目录不同，未发送复查请求", status_code=409
+            )
+        if self.recheck_lock.locked():
+            return error_response("已有远端复查正在进行，请稍后重试", status_code=409)
+        async with self.recheck_lock:
+            try:
+                await verify_remote(
+                    target,
+                    self.config.get("username", ""),
+                    os.getenv("ASTRBOT_WEBDAV_PASSWORD")
+                    or self.config.get("password", ""),
+                    size,
+                )
+                check = {"ok": True}
+            except WebDAVError as exc:
+                check = {"ok": False, "error": str(exc)}
+            check["time"] = datetime.now(timezone.utc).isoformat()
+            record["recheck"] = check
+            self._save_history()
+            return json_response(check)
+
     async def _scheduled(self, mode):
         self._enqueue(mode)
 
@@ -243,7 +322,28 @@ class BackupDashboard(Star):
     async def _backup(self, mode):
         async with self.lock:
             now = datetime.now(timezone.utc)
-            record = {"mode": mode, "time": now.isoformat(), "ok": False}
+            started = monotonic()
+            stage_started = started
+            stage = "准备"
+            self.phases[mode] = "正在准备"
+            record = {"mode": mode, "time": now.isoformat(), "ok": False, "stages": {}}
+
+            def set_stage(name: str | None):
+                """Finish timing the current stage and update the live dashboard.
+
+                Args:
+                    name: Next stage, or None when the run has finished.
+                """
+                nonlocal stage, stage_started
+                tick = monotonic()
+                record["stages"][stage] = round(tick - stage_started, 3)
+                stage_started = tick
+                if name is not None:
+                    stage = name
+                    self.phases[mode] = f"正在{name}"
+                else:
+                    self.phases[mode] = "空闲"
+
             try:
                 settings = dict(self.config)
                 data = Path(get_astrbot_data_path())
@@ -271,7 +371,7 @@ class BackupDashboard(Star):
                     prefix=".backup-", dir=backups
                 ) as work:
                     path = Path(work) / name
-                    self.phases[mode] = "正在打包"
+                    set_stage("打包")
                     await create_archive(
                         data,
                         path,
@@ -283,15 +383,16 @@ class BackupDashboard(Star):
                     size = path.stat().st_size
                     logger.info("Created %s archive %s (%d bytes)", mode, name, size)
                     if mode == "local":
+                        set_stage("保存")
                         path.replace(backups / name)
                     else:
-                        self.phases[mode] = "正在上传并校验"
                         await upload(
                             path,
                             collection,
                             settings.get("username", ""),
                             os.getenv("ASTRBOT_WEBDAV_PASSWORD")
                             or settings.get("password", ""),
+                            on_phase=set_stage,
                         )
                 record.update(ok=True, name=name, size=size)
                 logger.info("%s backup completed: %s (%d bytes)", mode, name, size)
@@ -301,6 +402,7 @@ class BackupDashboard(Star):
                     if str(exc).startswith(("WebDAV ", "请填写", "知识库管理器"))
                     else type(exc).__name__
                 )
+                record["failed_phase"] = stage
                 record["error"] = reason
                 logger.error(
                     "%s backup failed (destination=%s): %s",
@@ -309,16 +411,10 @@ class BackupDashboard(Star):
                     reason,
                 )
             finally:
-                self.phases[mode] = "空闲"
+                set_stage(None)
+                record["duration"] = round(monotonic() - started, 3)
                 self.history = [record, *self.history][:30]
-                try:
-                    temp = self.history_file.with_suffix(".tmp")
-                    temp.write_text(
-                        json.dumps(self.history, ensure_ascii=False), "utf-8"
-                    )
-                    temp.replace(self.history_file)
-                except OSError:
-                    logger.warning("Could not persist backup history")
+                self._save_history()
 
     async def terminate(self):
         self.closing = True

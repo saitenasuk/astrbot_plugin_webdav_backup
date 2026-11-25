@@ -272,6 +272,11 @@ summary {
   background: var(--tint);
   overflow-wrap: anywhere;
 }
+.recheck,
+.recheck-result:not(:empty),
+#receipt-recheck {
+  margin-top: 8px;
+}
 .run-details code {
   user-select: all;
 }

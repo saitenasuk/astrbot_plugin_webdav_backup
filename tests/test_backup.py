@@ -146,8 +146,10 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(request.headers.get('Authorization'))
             path=remote/request.match_info['name']
             if request.method=='PUT':
+                self.assertEqual(self.bot.phases['webdav'], '正在上传')
                 path.write_bytes(await request.read()); return web.Response(status=201)
             if request.method == 'PROPFIND':
+                self.assertEqual(self.bot.phases['webdav'], '正在校验')
                 self.assertEqual(request.headers['Depth'], '0')
                 return properties(request.path, path.stat().st_size)
             self.fail(f'Unexpected WebDAV method: {request.method}')
@@ -165,6 +167,9 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(r['ok'] for r in self.bot.history), self.bot.history)
                 for mode, directory in [('local', self.data/'backups'), ('webdav', remote)]:
                     record = next(r for r in self.bot.history if r['mode'] == mode)
+                    self.assertEqual(list(record['stages']), ['准备', '打包'] + (['上传', '校验'] if mode == 'webdav' else ['保存']))
+                    self.assertGreaterEqual(record['duration'], 0)
+                    self.assertAlmostEqual(sum(record['stages'].values()), record['duration'], delta=0.01)
                     with ZipFile(directory / record['name']) as z:
                         expected_temp = include_temp if mode == 'webdav' else not include_temp
                         self.assertEqual('directories/temp/media.jpg' in z.namelist(), expected_temp)
@@ -190,6 +195,8 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             self.config.update(url=str(server.make_url('/')),allow_http=True)
             await self.bot._backup('webdav')
         self.assertFalse(self.bot.history[0]['ok']);self.assertIn('403',self.bot.history[0]['error'])
+        self.assertEqual(self.bot.history[0]['failed_phase'], '上传')
+        self.assertNotIn('校验', self.bot.history[0]['stages'])
         self.assertEqual(list((self.data/'backups').iterdir()),[])
 
 
@@ -229,6 +236,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                     record = self.bot.history[0]
                     self.assertFalse(record['ok'], record)
                     self.assertIn(error, record['error'])
+                    self.assertEqual(record['failed_phase'], '校验')
                     self.assertTrue(record['remote'].endswith('.zip'))
                     self.assertEqual(json.loads(self.bot.history_file.read_text())[0], record)
 
@@ -285,6 +293,54 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(record['ok'], record)
             self.assertEqual(list(files), [record['name']])
             self.assertEqual(len(files[record['name']]), record['size'])
+
+    async def test_recheck_reads_only_and_persists_latest_attempt(self):
+        """Check a retained receipt without changing the original backup outcome."""
+        methods = []
+
+        async def handle(request):
+            methods.append((request.method, request.headers['Depth']))
+            self.assertEqual(request.headers['Authorization'], 'Basic dXNlcjplbnY=')
+            if missing:
+                return web.Response(status=404)
+            if request.path.endswith('/'):
+                return properties('/dav/archive.zip', size)
+            return properties('/unrelated.zip', 0)
+
+        app = web.Application()
+        app.router.add_route('*', '/dav/{name:.*}', handle)
+        async with TestServer(app) as server:
+            self.config.update(url=str(server.make_url('/dav/')), allow_http=True, username='user')
+            record = dict(mode='webdav', ok=True, time='2026-11-01T03:00:00Z',
+                          name='archive.zip', remote=str(server.make_url('/dav/archive.zip')), size=4096)
+            self.bot.history = [record]
+            request = SimpleNamespace(json=AsyncMock(return_value={'time': record['time']}))
+            with patch.object(plugin, 'request', request), patch.dict(plugin.os.environ, ASTRBOT_WEBDAV_PASSWORD='env'):
+                for size, missing, success in [(4096, False, True), (1024, False, False), (4096, True, False)]:
+                    methods.clear()
+                    response = await self.bot.verify_remote()
+                    receipt = json.loads(response.body)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(receipt['ok'], success)
+                    self.assertTrue(receipt['time'])
+                    self.assertEqual(methods, [('PROPFIND', '0')] if missing else [('PROPFIND', '0'), ('PROPFIND', '1')])
+                    if not success:
+                        self.assertIn('404' if missing else '大小不符', receipt['error'])
+                    self.assertTrue(record['ok'])
+                    self.assertEqual(json.loads(self.bot.history_file.read_text())[0]['recheck'], receipt)
+                methods.clear()
+                self.config['remote_dir'] = '/new'
+                self.assertEqual((await self.bot.verify_remote()).status_code, 409)
+                self.config['remote_dir'] = '/'
+                async with self.bot.recheck_lock:
+                    self.assertEqual((await self.bot.verify_remote()).status_code, 409)
+                for payload, expected in [({'time': 'expired'}, 404), ({'time': record['time'], 'remote': record['remote']}, 400)]:
+                    request.json.return_value = payload
+                    self.assertEqual((await self.bot.verify_remote()).status_code, expected)
+                request.json.return_value = {'time': record['time']}
+                record.pop('remote')
+                self.assertEqual((await self.bot.verify_remote()).status_code, 400)
+                self.assertEqual(methods, [])
 
     async def test_probe_uses_draft_credentials_and_only_deletes_its_own_files(self):
         methods = []

@@ -20,6 +20,11 @@ const bytes = (size) =>
       ? `${(size / 1024).toFixed(1)} KiB`
       : `${(size / 1048576).toFixed(1)} MiB`;
 const submitting = new Set();
+let rechecking = null;
+const checkText = (check) =>
+  `上次复查 ${time(check.time)} · ${check.ok ? "路径与字节数一致" : `未通过：${check.error}`}`;
+const seconds = (value) =>
+  value < 0.1 ? "< 0.1 秒" : `${value.toFixed(1)} 秒`;
 el("clock-zone").textContent = `记录时区：${clock.resolvedOptions().timeZone}`;
 function notice(message, error = false) {
   el("notice").textContent = message;
@@ -69,7 +74,7 @@ function drawOverview() {
   }
   let title, description;
   if (failure) {
-    title = `${names[failure.mode]} 最近一次备份失败`;
+    title = `${names[failure.mode]} 最近一次${failure.failed_phase || "备份"}失败`;
     description = `${time(failure.time)} · ${failure.error || "未记录失败原因"}`;
   } else if (invalid) {
     title = `${names[invalid]} 计划未生效`;
@@ -81,6 +86,9 @@ function drawOverview() {
     title = "尚未配置 WebDAV";
     description =
       "填写服务地址与目录，即可把备份保存到远端；本地备份可独立使用。";
+  } else if (verified?.recheck?.ok === false) {
+    title = "最近已校验的 ZIP 复查未通过";
+    description = checkText(verified.recheck);
   } else if (latestRemote?.ok && latestRemote.remote) {
     title = "WebDAV 备份已校验";
     description = "上传时已核对远端路径和字节数";
@@ -89,7 +97,11 @@ function drawOverview() {
     description = "手动运行一次，或等待下次定时任务";
   }
   el("overview").dataset.state =
-    failure || invalid ? "error" : verified ? "verified" : "neutral";
+    failure || invalid || verified?.recheck?.ok === false
+      ? "error"
+      : verified
+        ? "verified"
+        : "neutral";
   el("overview-title").textContent = title;
   el("overview-description").textContent = description;
   el("receipt-time").textContent = verified
@@ -101,6 +113,10 @@ function drawOverview() {
   el("receipt-note").textContent = verified
     ? `${bytes(verified.size)} · 当时路径与大小一致`
     : "最近 30 条记录中无已校验的 WebDAV 备份";
+  const check = verified?.recheck;
+  el("receipt-recheck").hidden = !check;
+  el("receipt-recheck").textContent = check ? checkText(check) : "";
+  el("receipt-recheck").classList.toggle("error", check?.ok === false);
 }
 function drawDestinations() {
   const { history, settings, phases, plan_errors: errors } = model;
@@ -247,7 +263,66 @@ function drawHistory() {
             "secondary",
           ),
         );
+      if (Number.isFinite(r.duration)) {
+        const stages = Object.entries(r.stages || {}).map(
+          ([stage, value]) => `${stage} ${seconds(value)}`,
+        );
+        detail.append(
+          node(
+            "p",
+            [`总耗时 ${seconds(r.duration)}`, ...stages].join(" · "),
+            "secondary",
+          ),
+        );
+      }
+      if (!r.ok && r.failed_phase)
+        detail.append(node("p", `失败阶段：${r.failed_phase}`));
+      if (
+        r.mode === "webdav" &&
+        r.ok &&
+        r.remote &&
+        r.name &&
+        Number.isSafeInteger(r.size)
+      ) {
+        const button = node("button", "复查远端文件", "recheck");
+        button.type = "button";
+        button.onclick = async () => {
+          if (rechecking !== null) return;
+          rechecking = key;
+          drawHistory();
+          try {
+            const check = await bridge.apiPost("verify-remote", {
+              time: r.time,
+            });
+            const current = model.history.find(
+              (record) => record.time === r.time && record.mode === r.mode,
+            );
+            if (current) current.recheck = check;
+            drawOverview();
+            showSaveToast(
+              check.ok
+                ? "复查通过：远端路径和字节数一致"
+                : `远端复查未通过：${check.error}`,
+              check.ok ? "success" : "error",
+            );
+          } catch (err) {
+            showSaveToast(`无法完成复查：${err.message}`, "error");
+          } finally {
+            rechecking = null;
+            drawHistory();
+          }
+        };
+        detail.append(button, node("p", undefined, "recheck-result"));
+      }
       row.append(summary, detail);
+    }
+    const recheck = row.querySelector(".recheck");
+    if (recheck) {
+      recheck.disabled = rechecking !== null;
+      recheck.textContent = rechecking === key ? "正在复查…" : "复查远端文件";
+      const result = row.querySelector(".recheck-result");
+      result.textContent = r.recheck ? checkText(r.recheck) : "";
+      result.classList.toggle("error", r.recheck?.ok === false);
     }
     if (history.children[i] !== row)
       history.insertBefore(row, history.children[i] || null);
@@ -438,7 +513,7 @@ try {
   el("dashboard").hidden = false;
   notice("");
   const timer = setInterval(() => {
-    if (!document.hidden && !busy)
+    if (!document.hidden && !busy && rechecking === null)
       refresh().catch((err) => notice(err.message, true));
   }, 5000);
   window.addEventListener("pagehide", () => clearInterval(timer), {

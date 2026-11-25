@@ -176,7 +176,7 @@ test("legacy success is not a receipt and next run stays in the plan time zone",
   await page.evaluate(() => {
     snapshot.next.webdav = "2026-11-27T03:00:00+08:00";
     snapshot.settings.webdav_timezone = "Asia/Shanghai";
-    snapshot.phases.webdav = "正在上传并校验";
+    snapshot.phases.webdav = "正在校验";
   });
   await page.clock.fastForward(5000);
   assert.match(
@@ -185,7 +185,73 @@ test("legacy success is not a receipt and next run stays in the plan time zone",
   );
   assert.match(
     await page.locator("#overview-title").innerText(),
-    /WebDAV.*正在上传并校验/,
+    /WebDAV.*正在校验/,
   );
   assert(await page.locator("#target-webdav .run-now").isDisabled());
+});
+
+test("explicit recheck updates the expanded receipt, not the original run", async (t) => {
+  const page = await openPage(
+    t,
+    [
+      { ...runs[2], duration: 9.5, stages: { 打包: 2, 上传: 7, 校验: 0.5 } },
+      { ...runs[1], failed_phase: "上传" },
+      runs[3],
+    ],
+    "https://dav.example.com/dav/",
+    375,
+  );
+  await page.evaluate(() => {
+    const record = snapshot.history[0];
+    window.AstrBotPluginView.apiPost = async (endpoint, payload) => {
+      posts.push({ endpoint, payload });
+      return new Promise((resolve) => {
+        window.finishCheck = () => {
+          record.recheck = {
+            ok: false,
+            time: "2026-11-27T11:30:00Z",
+            error: "WebDAV PROPFIND 返回 HTTP 404",
+          };
+          resolve(record.recheck);
+        };
+      });
+    };
+  });
+  await page.clock.fastForward(5000);
+  await page.locator(".run summary").first().click();
+  assert.match(
+    await page.locator(".run[open]").innerText(),
+    /上传 7.0 秒.*校验 0.5 秒/,
+  );
+  const button = page.getByRole("button", { name: "复查远端文件" });
+  assert.equal(await page.locator(".recheck").count(), 1);
+  assert.deepEqual(await page.evaluate(() => posts), []);
+  await button.click();
+  assert.deepEqual(await page.evaluate(() => posts), [
+    { endpoint: "verify-remote", payload: { time: runs[2].time } },
+  ]);
+  assert(await page.getByRole("button", { name: "正在复查…" }).isDisabled());
+  await page.evaluate(() => finishCheck());
+  assert.match(await page.locator(".recheck-result").innerText(), /404/);
+  assert.match(await page.locator(".receipt").innerText(), /404/);
+  assert.match(
+    await page.locator(".run summary").first().innerText(),
+    /成功 · 已校验/,
+  );
+  assert(
+    await page
+      .locator(".run")
+      .first()
+      .evaluate((e) => e.open),
+  );
+  await page.evaluate(() => {
+    snapshot.history[0].recheck = { ok: true, time: "2026-11-27T11:32:00Z" };
+  });
+  await page.clock.fastForward(5000);
+  assert.match(await page.locator(".recheck-result").innerText(), /11:32.*一致/);
+  assert(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  );
 });
