@@ -5,9 +5,9 @@
 ## 安装和首次备份
 
 1. 在 AstrBot WebUI 的插件页选择通过仓库地址安装，粘贴 `https://github.com/saitenasuk/astrbot_plugin_webdav_backup`。
-2. 打开插件详情页的 **备份仪表盘**，选择「本地」或「WebDAV」。两个目标默认都跳过 `temp`，定时备份默认关闭。
+2. 打开插件详情页的 **备份仪表盘**，在「备份目标」对应行点「设置」（首次使用远端时点「配置 WebDAV」）。两个目标默认都跳过 `temp`，定时备份默认关闭。
 3. 在所选目标下设置「备份 temp 目录」。需要定时执行时打开开关，填写五段 Cron 和 IANA 时区。默认本地每天 02:00，WebDAV 每天 03:00，时区均为 `Asia/Shanghai`。星期可写 `mon` 到 `sun`。
-4. 填写 WebDAV 服务地址、账号和远程目录。远程目录默认为 `/`，表示服务根目录。填写完毕后，点击「测试连接」验证当前输入。测试会写入、校验并删除一个小 ZIP。测试通过后点击「保存 WebDAV 设置」，再点击「立即备份到 WebDAV」。在「最近运行」可以查看最终文件的远端地址。
+4. 填写 WebDAV 服务地址、账号和远程目录。远程目录默认为 `/`，表示服务根目录。填写完毕后，点击「测试连接」验证当前输入。测试会写入、校验并删除一个小 ZIP。测试通过后点击「保存 WebDAV 设置」，再在 WebDAV 目标行点击「立即备份」。展开「最近运行」中的记录，可查看并复制远端路径。
 
 任务在 AstrBot 运行期间执行。两个目标同时触发时会排队，同一目标正在运行时会跳过重复触发。每次生成独立 ZIP，历史记录数只限制仪表盘显示，存储空间按实际保留的 ZIP 累计。
 
@@ -27,7 +27,7 @@
 
 目录遍历跳过符号链接、`.git`、`__pycache__` 和 `.pyc`。运行期间数据库与文件可以继续变化，知识库批量导入等写入任务结束后生成的备份更适合迁移。
 
-[本地与 WebDAV 设置截图](docs/zh/local-backup.md) · [Backup settings guide](docs/en/local-backup.md)
+[仪表盘、备份设置与恢复指引](docs/zh/local-backup.md) · [Backup settings guide](docs/en/local-backup.md)
 
 ## 本地、WebDAV 与恢复
 
@@ -40,6 +40,6 @@
 
 已在 AstrBot 4.29.3 和 4.30.0-beta.1 上验证原生导入。仪表盘采用官方 `plugin_page`、`astrbot.api.web` 和 `AstrBotPluginView` Bridge，页面资源随插件一起安装。
 
-安装 AstrBot 及插件依赖后，在插件目录运行 `python -m unittest discover -s tests -v`。测试使用临时数据库和本地 WebDAV 测试服务。
+安装 AstrBot 及插件依赖后，在插件目录运行 `python -m unittest discover -s tests -v`。测试使用临时数据库和本地 WebDAV 测试服务。前端回归使用模拟 Bridge，不访问远端；在可加载 Playwright 且已安装 Chromium 的 Node.js 环境中运行 `node --test tests/dashboard.cjs`。
 
 许可证为 AGPL-3.0。参见 [LICENSE](LICENSE)。

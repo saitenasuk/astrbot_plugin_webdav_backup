@@ -1,6 +1,4 @@
 <!doctype html>
-<!-- Rank the two destinations and their outcomes first, editable plans second, history third.
-     Save is the primary action. Use host surface/text/accent tokens and a 4/8/16/24/32 spacing scale. -->
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
@@ -13,92 +11,195 @@
     <main>
       <header>
         <h1>备份仪表盘</h1>
-        <p>管理本地与 WebDAV 备份，在 AstrBot 的备份列表中恢复。</p>
+        <span id="clock-zone" class="secondary"></span>
       </header>
       <p id="notice" role="status" aria-live="polite">正在读取备份状态…</p>
-      <section class="destinations" aria-label="备份目标" id="cards"></section>
-      <section class="panel" id="settings" hidden>
-        <h2>备份设置</h2>
-        <div role="group" aria-label="选择设置目标" class="switch">
-          <button type="button" data-mode="local" aria-pressed="true">
-            本地</button
-          ><button type="button" data-mode="webdav" aria-pressed="false">
-            WebDAV
-          </button>
-        </div>
-        <form id="form">
-          <fieldset>
-            <legend id="plan-title">本地计划</legend>
-            <label class="inline"
-              ><input type="checkbox" id="enabled" />启用定时备份</label
-            >
-            <div class="fields">
-              <label
-                >Cron 表达式<input
-                  type="text"
-                  id="cron"
-                  required
-                  aria-describedby="cron-help" /></label
-              ><label>时区<input type="text" id="timezone" required /></label>
-            </div>
-            <small id="cron-help"
-              >分、时、日、月、星期。例如 0 3 * * * 表示每天 03:00。</small
-            >
-          </fieldset>
-          <fieldset id="remote" hidden>
-            <legend>WebDAV 连接</legend>
-            <label
-              >WebDAV 服务地址<input
-                type="url"
-                id="url"
-                placeholder="https://dav.example.com/dav/"
-            /></label>
-            <label>远程目录<input type="text" id="remote_dir" placeholder="/" aria-describedby="remote-dir-help" /></label>
-            <small id="remote-dir-help">/ 表示服务根目录，也可填写已存在的子目录，例如 /backups。</small>
-            <div class="fields">
-              <label
-                >用户名<input
-                  type="text"
-                  id="username"
-                  autocomplete="off" /></label
-              ><label
-                >应用密码<input
-                  type="password"
-                  id="password"
-                  autocomplete="new-password"
-              /></label>
-            </div>
-            <label class="inline"
-              ><input type="checkbox" id="allow_http" />允许在可信内网使用明文
-              HTTP</label
-            >
-          </fieldset>
-          <fieldset>
-            <legend>备份内容</legend>
-            <p class="baseline">
-              常规备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
-            </p>
-            <div class="item">
-              <input type="checkbox" id="include-temp" aria-describedby="temp-hint" />
+      <div id="dashboard" hidden>
+        <section id="overview" aria-labelledby="overview-title">
+          <div class="status-block">
+            <p class="caption">运行总览</p>
+            <h2 id="overview-title"></h2>
+            <p id="overview-description"></p>
+            <button
+              type="button"
+              id="overview-action"
+              class="quiet"
+              hidden
+            ></button>
+          </div>
+          <div class="receipt">
+            <h3>最近已校验的 WebDAV 备份</h3>
+            <p id="receipt-time"></p>
+            <p id="receipt-dir" class="mono"></p>
+            <p id="receipt-note" class="secondary"></p>
+          </div>
+        </section>
+        <section aria-labelledby="destinations-title">
+          <h2 id="destinations-title">备份目标</h2>
+          <div id="destinations" class="panel"></div>
+          <template id="destination">
+            <article class="destination">
               <div>
-                <label for="include-temp"><strong>备份 temp 目录</strong></label>
-                <small id="temp-hint">data/temp 包含运行缓存、临时图片、语音和下载文件。</small>
+                <h3></h3>
+                <p class="phase secondary"></p>
               </div>
-            </div>
-          </fieldset>
-          <div class="footer">
-            <span id="save-feedback" role="status" aria-atomic="true"></span>
-            <div class="actions">
-              <button id="test-connection" type="button" hidden>测试连接</button>
-              <button id="save" class="primary" type="submit">保存本地设置</button>
+              <div>
+                <span class="caption">最近成功</span>
+                <p class="last"></p>
+              </div>
+              <div>
+                <span class="caption">下次运行</span>
+                <p class="next"></p>
+              </div>
+              <div class="row-actions">
+                <button type="button" class="run-now">立即备份</button>
+                <button type="button" class="edit quiet">设置</button>
+              </div>
+            </article>
+          </template>
+        </section>
+        <section aria-labelledby="history-title">
+          <div class="section-heading">
+            <h2 id="history-title">最近运行</h2>
+            <div class="filters">
+              <select id="history-filter" aria-label="按备份目标筛选">
+                <option value="all">全部目标</option>
+                <option value="local">本地</option>
+                <option value="webdav">WebDAV</option>
+              </select>
+              <label class="inline"
+                ><input type="checkbox" id="failures-only" />仅失败</label
+              >
             </div>
           </div>
-        </form>
-      </section>
-      <section class="panel">
-        <h2>最近运行</h2>
-        <div id="history"><p>正在读取…</p></div>
-      </section>
+          <div id="history" class="panel"></div>
+          <button
+            type="button"
+            id="history-more"
+            aria-controls="history"
+            class="quiet"
+            hidden
+          ></button>
+        </section>
+        <details class="panel" id="settings">
+          <summary>备份设置</summary>
+          <div class="settings-body">
+            <div role="group" aria-label="选择设置目标" class="switch">
+              <button type="button" data-mode="local" aria-pressed="true">
+                本地
+              </button>
+              <button type="button" data-mode="webdav" aria-pressed="false">
+                WebDAV
+              </button>
+            </div>
+            <form id="form">
+              <fieldset>
+                <legend id="plan-title">本地计划</legend>
+                <label class="inline"
+                  ><input type="checkbox" id="enabled" />启用定时备份</label
+                >
+                <div class="fields">
+                  <label
+                    >Cron 表达式<input
+                      type="text"
+                      id="cron"
+                      required
+                      aria-describedby="cron-help" /></label
+                  ><label
+                    >时区<input type="text" id="timezone" required
+                  /></label>
+                </div>
+                <small id="cron-help"
+                  >分、时、日、月、星期。例如 0 3 * * * 表示每天 03:00。</small
+                >
+              </fieldset>
+              <fieldset id="remote" hidden>
+                <legend>WebDAV 连接</legend>
+                <label
+                  >WebDAV 服务地址<input
+                    type="url"
+                    id="url"
+                    placeholder="https://dav.example.com/dav/"
+                /></label>
+                <label
+                  >远程目录<input
+                    type="text"
+                    id="remote_dir"
+                    placeholder="/"
+                    aria-describedby="remote-dir-help"
+                /></label>
+                <small id="remote-dir-help"
+                  >/ 表示服务根目录，也可填写已存在的子目录，例如
+                  /backups。</small
+                >
+                <div class="fields">
+                  <label
+                    >用户名<input
+                      type="text"
+                      id="username"
+                      autocomplete="off" /></label
+                  ><label
+                    >应用密码<input
+                      type="password"
+                      id="password"
+                      autocomplete="new-password"
+                  /></label>
+                </div>
+                <label class="inline"
+                  ><input
+                    type="checkbox"
+                    id="allow_http"
+                  />允许在可信内网使用明文 HTTP</label
+                >
+              </fieldset>
+              <fieldset>
+                <legend>备份内容</legend>
+                <p class="baseline">
+                  常规备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat
+                  数据和文生图模板。
+                </p>
+                <div class="item">
+                  <input
+                    type="checkbox"
+                    id="include-temp"
+                    aria-describedby="temp-hint"
+                  />
+                  <div>
+                    <label for="include-temp"
+                      ><strong>备份 temp 目录</strong></label
+                    >
+                    <small id="temp-hint"
+                      >data/temp 包含运行缓存、临时图片、语音和下载文件。</small
+                    >
+                  </div>
+                </div>
+              </fieldset>
+              <div class="footer">
+                <span
+                  id="save-feedback"
+                  role="status"
+                  aria-atomic="true"
+                ></span>
+                <div class="actions">
+                  <button id="test-connection" type="button" hidden>
+                    测试连接
+                  </button>
+                  <button id="save" class="primary" type="submit">
+                    保存本地设置
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </details>
+        <details class="restore">
+          <summary>如何恢复备份？</summary>
+          <p>
+            本地 ZIP 可在 AstrBot 原生备份列表中找到。WebDAV 备份请先取回
+            ZIP，再在原生备份页上传并导入。导入会替换主数据库及包中包含的目录，请先备份当前实例。
+          </p>
+        </details>
+      </div>
     </main>
     <script type="module" src="./app.js"></script>
   </body>
