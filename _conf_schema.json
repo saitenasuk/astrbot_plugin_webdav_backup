@@ -16,7 +16,7 @@
   },
   "local_items": {
     "type": "bool",
-    "description": "是否备份temp 目录",
+    "description": "备份 temp 目录",
     "hint": "data/temp 包含运行缓存、临时图片、语音和下载文件。",
     "default": false
   },
@@ -37,7 +37,7 @@
   },
   "webdav_items": {
     "type": "bool",
-    "description": "是否备份temp 目录",
+    "description": "备份 temp 目录",
     "hint": "data/temp 包含运行缓存、临时图片、语音和下载文件。",
     "default": false
   },
