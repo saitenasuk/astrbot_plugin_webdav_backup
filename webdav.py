@@ -1,6 +1,5 @@
 import asyncio
 from base64 import b64encode
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import monotonic
@@ -211,7 +210,7 @@ async def _verify(session, final, size):
         if reported is not None:
             if reported != size:
                 raise WebDAVError(
-                    f"WebDAV 远端文件大小不符（远端 {reported} 字节，预期 {size} 字节）"
+                    f"WebDAV 远端文件大小不符（远端 {reported} 字节，本地 {size} 字节）"
                 )
             logger.info(
                 "WebDAV verified %s (%d bytes, PROPFIND Depth=%s)", final, size, depth
@@ -230,13 +229,7 @@ async def _verify(session, final, size):
 
 
 async def upload(
-    path: Path,
-    collection: str,
-    username: str,
-    password: str,
-    *,
-    probe: bool = False,
-    on_phase: Callable[[str], None] | None = None,
+    path: Path, collection: str, username: str, password: str, *, probe: bool = False
 ) -> None:
     """Upload and verify a uniquely named archive, removing it after a probe.
 
@@ -246,13 +239,10 @@ async def upload(
         username: WebDAV user.
         password: WebDAV application password.
         probe: Delete the uniquely named test file after checking its properties.
-        on_phase: Optional callback invoked before upload and verification.
 
     Raises:
         WebDAVError: If the transfer, verification or probe cleanup fails.
     """
-    if on_phase:
-        on_phase("上传")
     final = collection + quote(path.name, safe="")
     size = path.stat().st_size
     headers = {}
@@ -276,8 +266,6 @@ async def upload(
             ):
                 pass
         try:
-            if on_phase:
-                on_phase("校验")
             await _verify(session, final, size)
         except (Exception, asyncio.CancelledError):
             if probe:
@@ -290,24 +278,3 @@ async def upload(
         if probe:
             async with _request(session, "DELETE", final, (200, 204)):
                 pass
-
-
-async def verify_remote(final: str, username: str, password: str, size: int) -> None:
-    """Verify the recorded remote archive without writing or deleting it.
-
-    Args:
-        final: Exact remote URL of the previously uploaded archive.
-        username: WebDAV user.
-        password: WebDAV password.
-        size: Expected archive size in bytes.
-
-    Raises:
-        WebDAVError: If the server does not confirm the expected file and size.
-    """
-    headers = {}
-    if username:
-        encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
-        headers["Authorization"] = f"Basic {encoded}"
-    timeout = aiohttp.ClientTimeout(total=30, sock_connect=5, sock_read=15)
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        await _verify(session, final, size)
