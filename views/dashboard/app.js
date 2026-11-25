@@ -104,6 +104,11 @@ function collect() {
   }
   return values;
 }
+function saveFeedback(message, state = "idle") {
+  const feedback = el("save-feedback");
+  feedback.dataset.state = state;
+  feedback.textContent = message;
+}
 function drawForm() {
   const conf = { ...model.settings, ...drafts[mode] };
   el("settings").hidden = false;
@@ -123,7 +128,7 @@ function drawForm() {
     : "输入应用密码";
   el("allow_http").checked = conf.allow_http;
   el("include-temp").checked = conf[`${mode}_items`];
-  el("dirty").textContent = drafts[mode] ? "有未保存的更改" : "";
+  saveFeedback(drafts[mode] ? "有未保存的更改" : "");
 }
 async function refresh() {
   if (loading) return;
@@ -137,8 +142,14 @@ async function refresh() {
 }
 el("form").oninput = () => {
   drafts[mode] = collect();
-  el("dirty").textContent = "有未保存的更改";
+  saveFeedback("有未保存的更改");
 };
+el("form").addEventListener("invalid", (event) => {
+  if (event.target === el("form").querySelector("input:invalid")) {
+    const label = event.target.labels[0].textContent.trim();
+    saveFeedback(`请检查${label}。${event.target.validationMessage}`, "error");
+  }
+}, true);
 for (const b of document.querySelectorAll("[data-mode]"))
   b.onclick = () => {
     if (!busy) {
@@ -149,9 +160,13 @@ for (const b of document.querySelectorAll("[data-mode]"))
 el("form").onsubmit = async (event) => {
   event.preventDefault();
   if (busy) return;
+  const values = collect();
   busy = true;
   el("save").disabled = true;
-  const values = collect();
+  el("save").textContent = "正在保存…";
+  saveFeedback(`正在保存${names[mode]}设置…`);
+  for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
+    control.disabled = true;
   try {
     await bridge.apiPost("settings", values);
     Object.assign(
@@ -163,14 +178,19 @@ el("form").onsubmit = async (event) => {
     if (values.password) model.password_set = true;
     delete drafts[mode];
     drawForm();
-    notice(`${names[mode]}设置已保存。`);
-    await refresh();
+    saveFeedback(`${names[mode]}设置已保存`, "success");
   } catch (err) {
-    notice(err.message, true);
+    saveFeedback(`保存失败。${err.message || "请稍后重试。"}`, "error");
+    return;
   } finally {
     busy = false;
+    for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
+      control.disabled = false;
+    el("remote").disabled = mode !== "webdav";
     el("save").disabled = false;
+    el("save").textContent = `保存${names[mode]}设置`;
   }
+  refresh().catch((err) => notice(`仪表盘刷新失败。${err.message}`, true));
 };
 try {
   if (!bridge) throw new Error("请从 AstrBot WebUI 的插件页面打开仪表盘。");

@@ -47,7 +47,7 @@ header p,
 small,
 .secondary,
 .item small,
-#dirty {
+#save-feedback {
   color: var(--muted);
 }
 header p {
@@ -57,7 +57,8 @@ header p {
   margin: 12px 0;
   min-height: 1.55em;
 }
-#notice.error {
+#notice.error,
+#save-feedback[data-state="error"] {
   color: var(--astrbot-color-error, #a12929);
 }
 .destinations,
@@ -188,6 +189,16 @@ input:not([type="checkbox"]) {
   margin-top: 24px;
   padding-top: 16px;
   border-top: 1px solid var(--line);
+}
+#save-feedback {
+  overflow-wrap: anywhere;
+}
+#save-feedback[data-state="success"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+#save {
+  flex-shrink: 0;
 }
 .run {
   align-items: flex-start;
