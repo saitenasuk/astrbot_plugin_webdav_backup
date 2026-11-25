@@ -82,8 +82,61 @@ async def _request(session, method, url, expected, **kwargs):
         raise WebDAVError(f"WebDAV {method} 连接异常（{type(exc).__name__}）") from exc
 
 
+def _reported_size(root, request_url, target):
+    """Read the target file's properties from a file or directory multistatus.
+
+    Args:
+        root: Parsed DAV multistatus document.
+        request_url: Request URI against which relative hrefs are resolved.
+        target: Expected absolute URL of the final file.
+
+    Returns:
+        The file size and an empty message, or None and a diagnostic.
+    """
+    responses = root.findall("{DAV:}response")
+    reason = f"返回 {len(responses)} 项，未找到与目标路径一致的 href"
+    for response in responses:
+        href = (response.findtext("{DAV:}href") or "").strip()
+        if not href:
+            continue
+        try:
+            resource = request_url.join(URL(href))
+        except ValueError:
+            continue
+        if resource != target:
+            if str(resource) == str(target) + "/":
+                reason = "服务器把目标 ZIP 列为目录（href 以 / 结尾）"
+            elif resource.name == target.name:
+                reason = "找到同名条目，但 href 的目录或主机与目标不符"
+            continue
+        reason = "目标条目缺少可用的 getcontentlength"
+        reported = None
+        for propstat in response.findall("{DAV:}propstat"):
+            status = (propstat.findtext("{DAV:}status") or "").split()
+            if len(status) < 2 or status[1] != "200":
+                if (
+                    len(status) >= 2
+                    and len(status[1]) == 3
+                    and status[1].isascii()
+                    and status[1].isdecimal()
+                ):
+                    reason = f"目标条目属性返回 HTTP {status[1]}"
+                continue
+            prop = propstat.find("{DAV:}prop")
+            if prop is None:
+                continue
+            if prop.find("{DAV:}resourcetype/{DAV:}collection") is not None:
+                return None, "服务器把目标 ZIP 列为目录"
+            length = (prop.findtext("{DAV:}getcontentlength") or "").strip()
+            if length.isascii() and length.isdecimal() and len(length) <= 20:
+                reported = int(length)
+        if reported is not None:
+            return reported, ""
+    return None, reason
+
+
 async def _verify(session, final, size):
-    """Check the final resource's own successful getcontentlength property.
+    """Verify the final ZIP directly or through its parent directory entry.
 
     Args:
         session: Authenticated HTTP client.
@@ -93,67 +146,67 @@ async def _verify(session, final, size):
     Raises:
         WebDAVError: If the server does not confirm the expected file and size.
     """
-    async with _request(
-        session,
-        "PROPFIND",
-        final,
-        (207,),
-        headers={
-            "Depth": "0",
-            "Content-Type": "application/xml; charset=utf-8",
-            "Cache-Control": "no-cache",
-        },
-        data=b'<propfind xmlns="DAV:"><prop><getcontentlength/></prop></propfind>',
-    ) as res:
-        try:
-            await res.content.readexactly(65537)
-        except asyncio.IncompleteReadError as exc:
-            xml = exc.partial
-        else:
-            raise WebDAVError("WebDAV PROPFIND 返回的文件属性过大")
-    try:
-        root = ElementTree.fromstring(xml, forbid_dtd=True)
-    except (
-        ElementTree.ParseError,
-        DefusedXmlException,
-        LookupError,
-        ValueError,
-    ) as exc:
-        raise WebDAVError(
-            "WebDAV PROPFIND 未返回有效的文件属性，请检查 WebDAV 目录地址"
-        ) from exc
     target = URL(final)
-    for response in (
-        root.findall("{DAV:}response") if root.tag == "{DAV:}multistatus" else ()
-    ):
-        href = response.findtext("{DAV:}href")
-        if not href or not href.strip():
-            continue
-        try:
-            if target.join(URL(href.strip())) != target:
-                continue
-        except ValueError:
-            continue
-        for propstat in response.findall("{DAV:}propstat"):
-            status = (propstat.findtext("{DAV:}status") or "").split()
-            length = (
-                propstat.findtext("{DAV:}prop/{DAV:}getcontentlength") or ""
-            ).strip()
-            if (
-                len(status) < 2
-                or status[1] != "200"
-                or not (length.isascii() and length.isdecimal() and len(length) <= 20)
-            ):
-                continue
-            if int(length) != size:
+    # Keep the collection's trailing slash so relative child hrefs resolve inside it.
+    for depth, url, limit in [
+        ("0", final, 64 * 1024),
+        ("1", final.rsplit("/", 1)[0] + "/", 4 * 1024 * 1024),
+    ]:
+        async with _request(
+            session,
+            "PROPFIND",
+            url,
+            (207,),
+            headers={
+                "Depth": depth,
+                "Content-Type": "application/xml; charset=utf-8",
+                "Cache-Control": "no-cache",
+            },
+            data=b'<propfind xmlns="DAV:"><prop><getcontentlength/><resourcetype/></prop></propfind>',
+        ) as res:
+            try:
+                await res.content.readexactly(limit + 1)
+            except asyncio.IncompleteReadError as exc:
+                xml = exc.partial
+            else:
                 raise WebDAVError(
-                    f"WebDAV 远端文件大小不符（远端 {int(length)} 字节，本地 {size} 字节）"
+                    f"WebDAV PROPFIND Depth={depth} 返回的属性超过 {limit // 1024} KiB"
                 )
-            logger.info("WebDAV verified %s (%d bytes)", final, size)
+        try:
+            root = ElementTree.fromstring(xml, forbid_dtd=True)
+        except (
+            ElementTree.ParseError,
+            DefusedXmlException,
+            LookupError,
+            ValueError,
+        ) as exc:
+            raise WebDAVError(
+                "WebDAV PROPFIND 未返回有效的文件属性，请检查 WebDAV 目录地址"
+            ) from exc
+        if root.tag != "{DAV:}multistatus":
+            raise WebDAVError(
+                "WebDAV PROPFIND 缺少 DAV multistatus，请检查 WebDAV 目录地址"
+            )
+        reported, reason = _reported_size(root, URL(url), target)
+        if reported is not None:
+            if reported != size:
+                raise WebDAVError(
+                    f"WebDAV 远端文件大小不符（远端 {reported} 字节，本地 {size} 字节）"
+                )
+            logger.info(
+                "WebDAV verified %s (%d bytes, PROPFIND Depth=%s)", final, size, depth
+            )
             return
-    raise WebDAVError(
-        "WebDAV PROPFIND 未确认最终文件的路径与大小，请检查远端目录和读取权限"
-    )
+        if depth == "0":
+            logger.info(
+                "WebDAV PROPFIND Depth=0 inconclusive for %s (%d entries, %d collections, %d length properties), checking parent collection",
+                final,
+                len(root.findall("{DAV:}response")),
+                len(root.findall(".//{DAV:}collection")),
+                len(root.findall(".//{DAV:}getcontentlength")),
+            )
+        else:
+            raise WebDAVError(f"WebDAV PROPFIND 未确认最终文件：父目录 {reason}")
 
 
 async def upload(

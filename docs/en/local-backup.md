@@ -10,6 +10,6 @@ Both switches start off on a new installation. Upgrades preserve each destinatio
 
 In the WebDAV settings, select **测试连接** (Test connection), to the left of Save. The test uses the current form values to write, rename, verify and delete a small ZIP in the target directory. Save the settings to use them for manual and scheduled backups.
 
-If you cannot find an archive, compare the remote target shown in Recent runs with the directory you are browsing. Filter the AstrBot logs by the ZIP filename to see the HTTP status of the write (`PUT`), rename (`MOVE`) and verification (`PROPFIND`). A verified run means the server reported the expected byte count at the final path. Older successful runs are labeled as unverified.
+If you cannot find an archive, compare the remote target shown in Recent runs with the directory you are browsing. Filter the AstrBot logs by the ZIP filename to see the HTTP status of the write (`PUT`), rename (`MOVE`) and verification (`PROPFIND`). If the log says `checking parent collection`, the plugin is looking up the exact ZIP path and size in the parent directory listing. `WebDAV verified` confirms the check. The connection test then deletes its test file. A verified run means the server reported the expected byte count at the final path. Older successful runs are labeled as unverified.
 
 ![WebDAV backup settings](../images/webdav-settings.png)
