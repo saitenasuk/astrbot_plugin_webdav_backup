@@ -193,6 +193,10 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             if request.method == 'MOVE':
                 return web.Response(status=204)
             self.assertEqual(request.method, 'PROPFIND')
+            if request.path == '/':
+                self.assertIn(fault, ('wrong_resource', 'prop_status'))
+                self.assertEqual(request.headers['Depth'], '1')
+                return properties('/different.zip', size)
             if fault == 'missing':
                 return web.Response(status=404)
             if fault == 'html':
@@ -207,7 +211,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
 
         size = None
         app = web.Application()
-        app.router.add_route('*', '/{name}', handle)
+        app.router.add_route('*', '/{name:.*}', handle)
         async with TestServer(app) as server:
             self.config.update(url=str(server.make_url('/')), allow_http=True)
             for fault, error in [('missing', 'HTTP 404'), ('html', 'HTTP 200'),
@@ -220,6 +224,62 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(error, record['error'])
                     self.assertTrue(record['remote'].endswith('.zip'))
                     self.assertEqual(json.loads(self.bot.history_file.read_text())[0], record)
+
+    async def test_directory_only_webdav_verification(self):
+        methods = []
+        files = {}
+        prefix = '/mount/dav/'
+
+        async def handle(request):
+            name = request.match_info['name']
+            methods.append((request.method, request.headers.get('Depth')))
+            if request.method == 'PUT':
+                files[name] = await request.read()
+            elif request.method == 'MOVE':
+                files[name.removesuffix('.partial')] = files.pop(name)
+            elif request.method == 'DELETE':
+                del files[name]
+            elif name:
+                self.assertEqual(request.headers['Depth'], '0')
+                return web.Response(status=207, text=(
+                    f'<multistatus xmlns="DAV:"><response><href>{request.path}/</href>'
+                    '<propstat><prop><resourcetype><collection/></resourcetype></prop>'
+                    '<status>HTTP/1.1 200 OK</status></propstat></response></multistatus>'
+                ))
+            else:
+                self.assertEqual(request.headers['Depth'], '1')
+                filename, = files
+                href = {'relative': filename, 'absolute': prefix + filename,
+                        'other_folder': '/other/' + filename, 'other_host': 'https://other.invalid' + prefix + filename,
+                        'missing': 'some-other.zip'}.get(case, prefix + filename)
+                return properties(href, len(files[filename]) + (case == 'truncated'),
+                                  '404 Not Found' if case == 'no_size' else '200 OK')
+            return web.Response(status=204)
+
+        app = web.Application()
+        app.router.add_route('*', prefix + '{name:.*}', handle)
+        async with TestServer(app) as server:
+            self.config.update(url=str(server.make_url(prefix)), allow_http=True)
+            for case, error in [('relative', None), ('absolute', None), ('truncated', '大小不符'),
+                                ('other_folder', '目录或主机'), ('other_host', '目录或主机'),
+                                ('missing', '未找到'), ('no_size', 'HTTP 404')]:
+                with self.subTest(case=case):
+                    methods.clear()
+                    payload = {'url': self.config['url'], 'allow_http': True}
+                    with patch.object(plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))):
+                        result = await self.bot.test_connection()
+                    self.assertEqual(methods, [('PUT', None), ('MOVE', None), ('PROPFIND', '0'),
+                                               ('PROPFIND', '1'), ('DELETE', None)])
+                    self.assertFalse(files)
+                    self.assertEqual(result.status_code, 502 if error else 200)
+                    if error:
+                        self.assertIn(error, json.loads(result.body)['message'])
+            case = 'relative'
+            await self.bot._backup('webdav')
+            record = self.bot.history[0]
+            self.assertTrue(record['ok'], record)
+            self.assertEqual(list(files), [record['name']])
+            self.assertEqual(len(files[record['name']]), record['size'])
 
     async def test_probe_uses_draft_credentials_and_only_deletes_its_own_files(self):
         methods = []
