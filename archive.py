@@ -21,13 +21,13 @@ DIRECTORIES = (
 )
 
 
-def _write_directories(zf, data, selected, plugin_folder):
+def _write_directories(zf, data, include_temp, plugin_folder):
     """Write only selected native directory entries and collect manifest statistics.
 
     Args:
         zf: Open destination archive, exclusively accessed by this worker.
         data: AstrBot data root.
-        selected: Selected backup items.
+        include_temp: Whether to include the temporary directory.
         plugin_folder: Installed directory name used by AstrBot for plugin config.
 
     Returns:
@@ -36,7 +36,11 @@ def _write_directories(zf, data, selected, plugin_folder):
     stats = {}
     for name in DIRECTORIES:
         root = data / name
-        if name not in selected or root.is_symlink() or not root.is_dir():
+        if (
+            (name == "temp" and not include_temp)
+            or root.is_symlink()
+            or not root.is_dir()
+        ):
             continue
         count = size = 0
 
@@ -79,22 +83,21 @@ def _write_directories(zf, data, selected, plugin_folder):
 
 
 async def create_archive(
-    data, target, main_db, kb_manager, selected, plugin_folder=NAME
+    data, target, main_db, kb_manager, include_temp: bool, plugin_folder=NAME
 ):
-    """Produce a native ZIP with the full main database and selected components.
+    """Produce a native ZIP with the standard backup components and optionally temp.
 
     Args:
         data: AstrBot data directory.
         target: New file in an isolated staging directory outside backed-up trees.
         main_db: Live database owned by the host event loop.
         kb_manager: Host knowledge base manager.
-        selected: Optional components to pack in addition to the main DB.
+        include_temp: Whether to include the temporary directory.
         plugin_folder: Actual installed folder name.
     """
-    kb = kb_manager if "knowledge_base" in selected else None
-    if "knowledge_base" in selected and kb is None:
+    if kb_manager is None:
         raise RuntimeError("知识库管理器尚未就绪")
-    exporter = AstrBotExporter(main_db, kb)
+    exporter = AstrBotExporter(main_db, kb_manager)
     with ZipFile(target, "x", compression=ZIP_DEFLATED) as zf:
 
         def write_json(member, value):
@@ -116,33 +119,27 @@ async def create_archive(
 
         main = await read_tables(main_db, MAIN_DB_MODELS)
         await asyncio.to_thread(write_json, "databases/main_db.json", main)
-        metadata = {}
-        if kb is not None:
-            metadata = await read_tables(kb.kb_db, KB_METADATA_MODELS)
-            await asyncio.to_thread(write_json, "databases/kb_metadata.json", metadata)
-            for kb_id, helper in list(kb.kb_insts.items()):
-                documents = await exporter._export_kb_documents(helper)
-                await asyncio.to_thread(
-                    write_json, f"databases/kb_{kb_id}/documents.json", documents
-                )
-                await exporter._export_faiss_index(zf, helper, kb_id)
-                await exporter._export_kb_media_files(zf, helper, kb_id)
-        if "config" in selected:
-            for filename in ("cmd_config.json", "mcp_server.json"):
-                path = data / filename
-                if path.is_file() and not path.is_symlink():
-                    content = await asyncio.to_thread(path.read_bytes)
-                    member = f"config/{filename}"
-                    zf.writestr(member, content)
-                    exporter._add_checksum(member, content)
-        if "attachments" in selected:
-            await exporter._export_attachments(zf, main.get("attachments", []))
+        metadata = await read_tables(kb_manager.kb_db, KB_METADATA_MODELS)
+        await asyncio.to_thread(write_json, "databases/kb_metadata.json", metadata)
+        for kb_id, helper in list(kb_manager.kb_insts.items()):
+            documents = await exporter._export_kb_documents(helper)
+            await asyncio.to_thread(
+                write_json, f"databases/kb_{kb_id}/documents.json", documents
+            )
+            await exporter._export_faiss_index(zf, helper, kb_id)
+            await exporter._export_kb_media_files(zf, helper, kb_id)
+        for filename in ("cmd_config.json", "mcp_server.json"):
+            path = data / filename
+            if path.is_file() and not path.is_symlink():
+                content = await asyncio.to_thread(path.read_bytes)
+                member = f"config/{filename}"
+                zf.writestr(member, content)
+                exporter._add_checksum(member, content)
+        await exporter._export_attachments(zf, main.get("attachments", []))
         stats = await asyncio.to_thread(
-            _write_directories, zf, data, selected, plugin_folder
+            _write_directories, zf, data, include_temp, plugin_folder
         )
         manifest = exporter._generate_manifest(main, metadata, stats)
-        if "attachments" not in selected:
-            manifest["files"]["attachments"] = []
         manifest["has_config"] = "config/cmd_config.json" in zf.namelist()
         manifest["has_knowledge_bases"] = bool(metadata.get("knowledge_bases"))
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))

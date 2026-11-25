@@ -1,7 +1,9 @@
-# Local backup contents
+# Local and WebDAV backup contents
 
-Open **Backup dashboard → Backup settings → Local**. Set **Include the temp directory** and save the local settings. Manual and scheduled local backups use the saved setting.
+In **Backup dashboard → Backup settings**, choose **Local** or **WebDAV**. Enable **是否备份temp 目录** to include `data/temp` in manual and scheduled backups for that destination, then save. The note below the switch lists cached files, temporary images, audio and downloads.
 
-New installations exclude `data/temp` by default. Enable the switch to include cached files, temporary images, audio and downloads alongside all standard backup items. When upgrading from v1.0.0, the previous local selection for `temp` sets the initial switch position.
+Both switches start off on a new installation. Upgrades preserve each destination’s previous `temp` selection. Both destinations include all standard backup items.
 
-![Local settings showing the temp directory checkbox](../images/local-settings.png)
+![Local backup settings](../images/local-settings.png)
+
+![WebDAV backup settings](../images/webdav-settings.png)

@@ -72,14 +72,16 @@
           </fieldset>
           <fieldset>
             <legend>备份内容</legend>
-            <p id="local-scope" class="baseline">
-              本地备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
+            <p class="baseline">
+              常规备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
             </p>
-            <p id="webdav-scope" class="baseline" hidden>
-              <strong>主数据库 · 始终包含</strong
-              ><br />会话、消息、人格和附件记录。AstrBot 原生导入需要完整主库。
-            </p>
-            <div id="items" class="items"></div>
+            <div class="item">
+              <input type="checkbox" id="include-temp" aria-describedby="temp-hint" />
+              <div>
+                <label for="include-temp"><strong>是否备份temp 目录</strong></label>
+                <small id="temp-hint">data/temp 包含运行缓存、临时图片、语音和下载文件。</small>
+              </div>
+            </div>
           </fieldset>
           <div class="footer">
             <span id="dirty" role="status"></span

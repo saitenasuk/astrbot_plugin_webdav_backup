@@ -61,8 +61,7 @@ header p {
   color: var(--astrbot-color-error, #a12929);
 }
 .destinations,
-.fields,
-.items {
+.fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
@@ -177,10 +176,6 @@ input:not([type="checkbox"]) {
 .fields {
   margin: 8px 0;
 }
-.items {
-  gap: 14px 24px;
-}
-.item span,
 .item small {
   display: block;
 }
@@ -223,8 +218,7 @@ input:not([type="checkbox"]) {
     padding: 16px;
   }
   .destinations,
-  .fields,
-  .items {
+  .fields {
     grid-template-columns: 1fr;
   }
   .destinations {

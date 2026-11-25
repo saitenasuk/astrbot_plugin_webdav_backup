@@ -42,7 +42,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         await kb.initialize()
         self.addAsyncCleanup(kb.engine.dispose)
         self.kb_manager = SimpleNamespace(kb_db=kb, kb_insts={})
-        self.config.update(webdav_items=['temp'], password='private')
+        self.config.update(password='private')
         with patch.object(plugin.StarTools,'get_data_dir',return_value=self.data):
             self.bot=plugin.BackupDashboard(MagicMock(get_db=lambda:self.db,kb_manager=self.kb_manager),self.config)
         await self.bot.initialize()
@@ -86,7 +86,7 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             payload = SimpleNamespace(json=AsyncMock(return_value={'local_items': include_temp}))
             with patch.object(plugin, 'request', payload):
                 self.assertEqual((await self.bot.settings()).status_code, 200)
-            self.assertEqual(self.config['webdav_items'], ['temp'])
+            self.assertIs(self.config['webdav_items'], False)
             await self.bot._backup('local')
             record = self.bot.history[0]
             self.assertTrue(record['ok'], record)
@@ -99,12 +99,17 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(name.startswith('files/attachments/') for name in archive.namelist()))
 
     async def test_upgrade_keeps_previous_temp_choice(self):
-        for legacy in ([], ['skills'], ['temp', 'config']):
-            self.config['local_items'] = legacy
+        for local, webdav, expected in [
+            (['temp'], [], (True, False)),
+            ([], ['config', 'temp'], (False, True)),
+            (True, ['config'], (True, False)),
+            (False, True, (False, True)),
+        ]:
+            self.config.update(local_items=local, webdav_items=webdav)
             with patch.object(plugin.StarTools, 'get_data_dir', return_value=self.data):
                 plugin.BackupDashboard(MagicMock(), self.config)
-            self.assertIs(self.config['local_items'], 'temp' in legacy)
-            self.assertEqual(self.config['webdav_items'], ['temp'])
+            self.assertIs(self.config['local_items'], expected[0])
+            self.assertIs(self.config['webdav_items'], expected[1])
 
     async def test_webdav_put_move_and_independent_selection(self):
         remote=self.data/'remote'
@@ -118,14 +123,26 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         app=web.Application(); app.router.add_route('*','/{name}',handle)
         async with TestServer(app) as server:
             self.config.update(url=str(server.make_url('/')),username='backup',allow_http=True)
-            for mode in plugin.MODES: self.bot._enqueue(mode)
-            await asyncio.gather(*self.bot.tasks.values())
-        self.assertTrue(all(r['ok'] for r in self.bot.history),self.bot.history)
-        path, = remote.iterdir()
-        with ZipFile(path) as z:
-            self.assertIn('directories/temp/media.jpg',z.namelist())
-            self.assertNotIn('directories/skills/guide.md',z.namelist())
-        self.assertEqual(len(list((self.data/'backups').iterdir())),1)
+            for include_temp in (True, False):
+                self.config['local_items'] = not include_temp
+                payload = SimpleNamespace(json=AsyncMock(return_value={'webdav_items': include_temp}))
+                with patch.object(plugin, 'request', payload):
+                    self.assertEqual((await self.bot.settings()).status_code, 200)
+                for mode in plugin.MODES:
+                    self.bot._enqueue(mode)
+                await asyncio.gather(*self.bot.tasks.values())
+                self.assertTrue(all(r['ok'] for r in self.bot.history), self.bot.history)
+                for mode, directory in [('local', self.data/'backups'), ('webdav', remote)]:
+                    record = next(r for r in self.bot.history if r['mode'] == mode)
+                    with ZipFile(directory / record['name']) as z:
+                        expected_temp = include_temp if mode == 'webdav' else not include_temp
+                        self.assertEqual('directories/temp/media.jpg' in z.namelist(), expected_temp)
+                        self.assertEqual('temp' in json.loads(z.read('manifest.json'))['directories'], expected_temp)
+                        self.assertIn('directories/skills/guide.md', z.namelist())
+                        self.assertIn('databases/main_db.json', z.namelist())
+                        self.assertIn('databases/kb_metadata.json', z.namelist())
+        self.assertEqual(len(list(remote.iterdir())), 2)
+        self.assertEqual(len(list((self.data/'backups').iterdir())), 2)
 
     async def test_upload_failure_and_configuration(self):
         with patch.object(plugin,'request',SimpleNamespace(json=AsyncMock(return_value={'local_enabled':True, 'local_cron':'0 4 * * *'}))):

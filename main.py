@@ -25,9 +25,13 @@ MODES = ("local", "webdav")
 class BackupDashboard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        # Keep the original config key so AstrBot preserves its value during upgrades.
-        if isinstance(config.get("local_items"), list):
-            config.save_config({"local_items": "temp" in config["local_items"]})
+        # Keep each destination's temp selection from versions with item lists.
+        migrated = {}
+        for key in ("local_items", "webdav_items"):
+            if isinstance(config.get(key), list):
+                migrated[key] = "temp" in config[key]
+        if migrated:
+            config.save_config(migrated)
         self.config = config
         self.scheduler = None
         self.tasks = {}
@@ -87,7 +91,6 @@ class BackupDashboard(Star):
             for key, spec in SCHEMA.items()
             if key != "password"
         }
-        options = SCHEMA["webdav_items"]
         jobs = {
             job.id: job.next_run_time.isoformat()
             for job in self.scheduler.get_jobs()
@@ -99,15 +102,6 @@ class BackupDashboard(Star):
                 "password_set": bool(
                     self.config.get("password") or os.getenv("ASTRBOT_WEBDAV_PASSWORD")
                 ),
-                "items": [
-                    {"key": k, "name": n, "hint": h}
-                    for k, n, h in zip(
-                        options["options"],
-                        options["labels"],
-                        options["subtitles"],
-                        strict=True,
-                    )
-                ],
                 "phases": self.phases,
                 "next": jobs,
                 "plan_errors": self.plan_errors,
@@ -129,21 +123,10 @@ class BackupDashboard(Star):
         try:
             for key, value in payload.items():
                 spec = SCHEMA[key]
-                if (
-                    type(value)
-                    is not {"bool": bool, "string": str, "list": list}[spec["type"]]
-                ):
+                if type(value) is not {"bool": bool, "string": str}[spec["type"]]:
                     raise ValueError(f"无效设置项 {key}")
                 if isinstance(value, str) and len(value) > 4096:
                     raise ValueError(f"设置值过长 {key}")
-                if isinstance(value, list) and (
-                    any(
-                        not isinstance(x, str) or x not in spec["options"]
-                        for x in value
-                    )
-                    or len(value) != len(set(value))
-                ):
-                    raise ValueError("未知或重复的备份项")
                 candidate[key] = value
             for mode in MODES:
                 try:
@@ -193,14 +176,6 @@ class BackupDashboard(Star):
             record = {"mode": mode, "time": now.isoformat(), "ok": False}
             try:
                 settings = dict(self.config)
-                if mode == "local":
-                    selected = set(SCHEMA["webdav_items"]["options"])
-                    if not settings.get("local_items", False):
-                        selected.discard("temp")
-                else:
-                    selected = set(
-                        settings.get("webdav_items", SCHEMA["webdav_items"]["default"])
-                    )
                 data = Path(get_astrbot_data_path())
                 backups = data / "backups"
                 backups.mkdir(parents=True, exist_ok=True)
@@ -221,8 +196,8 @@ class BackupDashboard(Star):
                         path,
                         self.context.get_db(),
                         self.context.kb_manager,
-                        selected,
-                        Path(__file__).parent.name,
+                        include_temp=settings.get(f"{mode}_items", False),
+                        plugin_folder=Path(__file__).parent.name,
                     )
                     size = path.stat().st_size
                     if mode == "local":

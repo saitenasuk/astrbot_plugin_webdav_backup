@@ -96,12 +96,8 @@ function collect() {
   for (const key of ["enabled", "cron", "timezone"])
     values[`${mode}_${key}`] =
       key === "enabled" ? el(key).checked : el(key).value.trim();
-  if (mode === "local") {
-    values.local_items = el("items").querySelector("input").checked;
-  } else {
-    values.webdav_items = [...el("items").querySelectorAll(":checked")].map(
-      (input) => input.value,
-    );
+  values[`${mode}_items`] = el("include-temp").checked;
+  if (mode === "webdav") {
     for (const key of ["url", "username"]) values[key] = el(key).value.trim();
     values.allow_http = el("allow_http").checked;
     if (el("password").value) values.password = el("password").value;
@@ -126,23 +122,7 @@ function drawForm() {
     ? "已设置，留空保留"
     : "输入应用密码";
   el("allow_http").checked = conf.allow_http;
-  const local = mode === "local";
-  el("local-scope").hidden = !local;
-  el("webdav-scope").hidden = local;
-  const items = local ? model.items.filter((item) => item.key === "temp") : model.items;
-  el("items").replaceChildren(
-    ...items.map((item) => {
-      const label = node("label", undefined, "item"),
-        input = node("input"),
-        text = node("span");
-      input.type = "checkbox";
-      input.value = item.key;
-      input.checked = local ? conf.local_items : conf.webdav_items.includes(item.key);
-      text.append(node("strong", local ? "备份 temp 目录" : item.name), node("small", item.hint));
-      label.append(input, text);
-      return label;
-    }),
-  );
+  el("include-temp").checked = conf[`${mode}_items`];
   el("dirty").textContent = drafts[mode] ? "有未保存的更改" : "";
 }
 async function refresh() {
