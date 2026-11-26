@@ -1,9 +1,10 @@
 import asyncio
 import json
-import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 from zipfile import ZipFile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,10 +19,15 @@ from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .archive import NAME, create_archive
-from .webdav import WebDAVError, collection_url, upload
+from .webdav import WebDAVError, collection_url, prune_remote, upload
 
 SCHEMA = json.loads(Path(__file__).with_name("_conf_schema.json").read_text("utf-8"))
 MODES = ("local", "webdav")
+MAX_KEEP_COUNT = 1000
+BACKUP_NAME_PATTERNS = {
+    mode: re.compile(rf"^astrbot_backup_\d{{8}}_\d{{6}}_{mode}_[0-9a-f]{{12}}\.zip$")
+    for mode in MODES
+}
 
 
 class BackupDashboard(Star):
@@ -38,6 +44,7 @@ class BackupDashboard(Star):
         self.scheduler = None
         self.tasks = {}
         self.phases = dict.fromkeys(MODES, "空闲")
+        self.phase_started: dict[str, str | None] = dict.fromkeys(MODES, None)
         self.lock = asyncio.Lock()
         self.closing = False
         self.history = []
@@ -46,6 +53,7 @@ class BackupDashboard(Star):
         for endpoint, method, handler in [
             ("dashboard", "GET", self.dashboard),
             ("settings", "POST", self.settings),
+            ("cron-preview", "POST", self.cron_preview),
             ("test-connection", "POST", self.test_connection),
             ("run", "POST", self.run_now),
         ]:
@@ -89,6 +97,12 @@ class BackupDashboard(Star):
                 logger.warning("Invalid schedule for %s: %s", mode, type(exc).__name__)
 
     async def dashboard(self):
+        """Return full dashboard telemetry, configuration summary, and run history.
+
+        Returns:
+            A JSON response containing settings, phases, schedules, storage stats,
+            and recent run history.
+        """
         public = {
             key: self.config.get(key, spec["default"])
             for key, spec in SCHEMA.items()
@@ -99,20 +113,52 @@ class BackupDashboard(Star):
             for job in self.scheduler.get_jobs()
             if job.next_run_time
         }
+        backups_dir = Path(get_astrbot_data_path()) / "backups"
+        total_count = total_size = plugin_count = plugin_size = 0
+        if backups_dir.is_dir():
+            try:
+                for entry in backups_dir.iterdir():
+                    if (
+                        entry.is_symlink()
+                        or not entry.is_file()
+                        or not entry.name.endswith(".zip")
+                    ):
+                        continue
+                    try:
+                        size = entry.stat().st_size
+                    except OSError:
+                        continue
+                    total_count += 1
+                    total_size += size
+                    if BACKUP_NAME_PATTERNS["local"].fullmatch(entry.name):
+                        plugin_count += 1
+                        plugin_size += size
+            except OSError:
+                logger.warning("Could not inspect local backup directory")
         return json_response(
             {
                 "settings": public,
-                "password_set": bool(
-                    self.config.get("password") or os.getenv("ASTRBOT_WEBDAV_PASSWORD")
-                ),
+                "password_set": bool(self.config.get("password")),
                 "phases": self.phases,
+                "phase_started": self.phase_started,
                 "next": jobs,
                 "plan_errors": self.plan_errors,
                 "history": self.history,
+                "local_storage": {
+                    "total_count": total_count,
+                    "total_size": total_size,
+                    "plugin_count": plugin_count,
+                    "plugin_size": plugin_size,
+                },
             }
         )
 
     async def settings(self):
+        """Validate and persist updated plugin backup settings.
+
+        Returns:
+            A JSON response confirming persistence or a 400 error response.
+        """
         payload = await request.json(default=None)
         if (
             not isinstance(payload, dict)
@@ -123,13 +169,16 @@ class BackupDashboard(Star):
         candidate = {
             key: self.config.get(key, spec["default"]) for key, spec in SCHEMA.items()
         }
+        type_map = {"bool": bool, "string": str, "int": int}
         try:
             for key, value in payload.items():
                 spec = SCHEMA[key]
-                if type(value) is not {"bool": bool, "string": str}[spec["type"]]:
+                if type(value) is not type_map[spec["type"]]:
                     raise ValueError(f"无效设置项 {key}")
                 if isinstance(value, str) and len(value) > 4096:
                     raise ValueError(f"设置值过长 {key}")
+                if spec["type"] == "int" and not (0 <= value <= MAX_KEEP_COUNT):
+                    raise ValueError(f"保留份数需在 0 到 {MAX_KEEP_COUNT} 之间")
                 candidate[key] = value
             for mode in MODES:
                 try:
@@ -148,6 +197,43 @@ class BackupDashboard(Star):
         self.config.save_config(candidate)
         self._apply_plans()
         return json_response({"saved": True})
+
+    async def cron_preview(self):
+        """Preview upcoming trigger times for a Cron expression and IANA timezone.
+
+        Returns:
+            A JSON response with the next fire times or a 400 error response.
+        """
+        payload = await request.json(default=None)
+        if not isinstance(payload, dict):
+            return error_response("参数无效", status_code=400)
+        cron = payload.get("cron")
+        tz_name = payload.get("timezone")
+        count = payload.get("count", 3)
+        if (
+            not isinstance(cron, str)
+            or not isinstance(tz_name, str)
+            or type(count) is not int
+            or not (1 <= count <= 5)
+        ):
+            return error_response("请检查 Cron 表达式、时区或预览数量", status_code=400)
+        try:
+            tz = ZoneInfo(tz_name.strip())
+            trigger = CronTrigger.from_crontab(cron.strip(), timezone=tz)
+        except (ValueError, ZoneInfoNotFoundError):
+            return error_response("请检查五段 Cron 表达式与 IANA 时区", status_code=400)
+        now = datetime.now(tz)
+        runs = []
+        prev = None
+        cursor = now
+        for _ in range(count):
+            fire = trigger.get_next_fire_time(prev, cursor)
+            if fire is None:
+                break
+            runs.append(fire.isoformat())
+            prev = fire
+            cursor = fire
+        return json_response({"next_runs": runs})
 
     async def test_connection(self):
         """Exercise a transfer using the current dashboard inputs without saving them.
@@ -176,14 +262,9 @@ class BackupDashboard(Star):
                 payload.get("remote_dir", "/"),
             )
             username = payload.get("username", "")
-            env_password = os.getenv("ASTRBOT_WEBDAV_PASSWORD")
-            password = (
-                env_password
-                or payload.get("password")
-                or self.config.get("password", "")
-            )
-            if password and username and (env_password or not payload.get("password")):
-                # A draft endpoint must not receive credentials for a different server.
+            password = payload.get("password") or self.config.get("password", "")
+            if password and username and not payload.get("password"):
+                # A draft endpoint must not receive saved credentials for a different server.
                 saved = self.config.get("url", "")
                 if (
                     not saved
@@ -192,7 +273,7 @@ class BackupDashboard(Star):
                     or self.config.get("username", "") != username
                 ):
                     return error_response(
-                        "地址或用户名已更改。请重新输入密码，使用环境变量密码时请先保存连接设置。",
+                        "地址或用户名已更改，请重新输入密码后再测试。",
                         status_code=400,
                     )
         except ValueError as exc:
@@ -213,13 +294,14 @@ class BackupDashboard(Star):
             return error_response(reason, status_code=502)
 
     async def _scheduled(self, mode):
-        self._enqueue(mode)
+        self._enqueue(mode, trigger="schedule")
 
-    def _enqueue(self, mode):
+    def _enqueue(self, mode, trigger: str = "manual"):
         if self.closing or (mode in self.tasks and not self.tasks[mode].done()):
             return False
         self.phases[mode] = "排队中"
-        self.tasks[mode] = asyncio.create_task(self._backup(mode))
+        self.phase_started[mode] = datetime.now(timezone.utc).isoformat()
+        self.tasks[mode] = asyncio.create_task(self._backup(mode, trigger=trigger))
         return True
 
     async def run_now(self):
@@ -236,16 +318,24 @@ class BackupDashboard(Star):
                 )
             except ValueError as exc:
                 return error_response(str(exc), status_code=400)
-        if not self._enqueue(mode):
+        if not self._enqueue(mode, trigger="manual"):
             return error_response("任务已排队或正在运行", status_code=409)
         return json_response({"queued": True})
 
-    async def _backup(self, mode):
+    async def _backup(self, mode, trigger: str = "manual"):
         async with self.lock:
+            started = monotonic()
             now = datetime.now(timezone.utc)
-            record = {"mode": mode, "time": now.isoformat(), "ok": False}
+            settings = dict(self.config)
+            include_temp = bool(settings.get(f"{mode}_items", False))
+            record = {
+                "mode": mode,
+                "trigger": trigger,
+                "time": now.isoformat(),
+                "include_temp": include_temp,
+                "ok": False,
+            }
             try:
-                settings = dict(self.config)
                 data = Path(get_astrbot_data_path())
                 backups = data / "backups"
                 backups.mkdir(parents=True, exist_ok=True)
@@ -261,10 +351,11 @@ class BackupDashboard(Star):
                 if mode == "webdav":
                     record["remote"] = collection + name
                 logger.info(
-                    "Starting %s backup %s (include_temp=%s, destination=%s)",
+                    "Starting %s backup %s (trigger=%s, include_temp=%s, destination=%s)",
                     mode,
                     name,
-                    settings.get(f"{mode}_items", False),
+                    trigger,
+                    include_temp,
                     record.get("remote", backups),
                 )
                 with tempfile.TemporaryDirectory(
@@ -277,7 +368,7 @@ class BackupDashboard(Star):
                         path,
                         self.context.get_db(),
                         self.context.kb_manager,
-                        include_temp=settings.get(f"{mode}_items", False),
+                        include_temp=include_temp,
                         plugin_folder=Path(__file__).parent.name,
                     )
                     size = path.stat().st_size
@@ -290,11 +381,56 @@ class BackupDashboard(Star):
                             path,
                             collection,
                             settings.get("username", ""),
-                            os.getenv("ASTRBOT_WEBDAV_PASSWORD")
-                            or settings.get("password", ""),
+                            settings.get("password", ""),
                         )
                 record.update(ok=True, name=name, size=size)
                 logger.info("%s backup completed: %s (%d bytes)", mode, name, size)
+
+                keep_count = settings.get(f"{mode}_keep_count", 0)
+                if isinstance(keep_count, int) and not isinstance(keep_count, bool) and keep_count > 0:
+                    self.phases[mode] = "正在清理旧备份"
+                    try:
+                        if mode == "local":
+                            owned = sorted(
+                                (
+                                    entry
+                                    for entry in backups.iterdir()
+                                    if not entry.is_symlink()
+                                    and entry.is_file()
+                                    and BACKUP_NAME_PATTERNS["local"].fullmatch(
+                                        entry.name
+                                    )
+                                ),
+                                key=lambda entry: entry.name,
+                                reverse=True,
+                            )
+                            pruned = 0
+                            for old_file in owned[keep_count:]:
+                                old_file.unlink(missing_ok=True)
+                                pruned += 1
+                                logger.info("Pruned old local backup %s", old_file.name)
+                        else:
+                            pruned = await prune_remote(
+                                collection,
+                                settings.get("username", ""),
+                                settings.get("password", ""),
+                                keep_count,
+                                BACKUP_NAME_PATTERNS["webdav"],
+                            )
+                        if pruned:
+                            record["pruned"] = pruned
+                    except (WebDAVError, OSError) as exc:
+                        prune_reason = (
+                            str(exc)
+                            if isinstance(exc, WebDAVError)
+                            else type(exc).__name__
+                        )
+                        record["prune_error"] = prune_reason
+                        logger.warning(
+                            "%s backup succeeded, but pruning failed: %s",
+                            mode,
+                            prune_reason,
+                        )
             except Exception as exc:
                 reason = (
                     str(exc)
@@ -309,7 +445,9 @@ class BackupDashboard(Star):
                     reason,
                 )
             finally:
+                record["duration_ms"] = int((monotonic() - started) * 1000)
                 self.phases[mode] = "空闲"
+                self.phase_started[mode] = None
                 self.history = [record, *self.history][:30]
                 try:
                     temp = self.history_file.with_suffix(".tmp")

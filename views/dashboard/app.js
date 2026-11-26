@@ -1,200 +1,825 @@
 const bridge = window.AstrBotPluginView;
 const el = (id) => document.getElementById(id);
-const names = { local: "本地", webdav: "WebDAV" };
+const NAMES = { local: "本地", webdav: "WebDAV" };
 const drafts = {};
-let model,
-  mode = "local",
-  busy = false,
-  loading = false;
-const time = (iso) => new Date(iso).toLocaleString("zh-CN", { hour12: false });
-const bytes = (size) => `${(size / 1048576).toFixed(1)} MiB`;
-function notice(message, error = false) {
-  el("notice").textContent = message;
-  el("notice").classList.toggle("error", error);
-}
+
+let model = null;
+let activeTab = "history";
+let mode = "local";
+let filterMode = "all";
+let filterStatus = "all";
+let busy = false;
+let loading = false;
+let lastSyncAt = null;
+let toastTimer = null;
+let cronPreviewTimer = null;
+let pollTimer = null;
+
 function node(tag, text, cls) {
   const element = document.createElement(tag);
-  if (text !== undefined) element.textContent = text;
+  if (text !== undefined && text !== null) element.textContent = String(text);
   if (cls) element.className = cls;
   return element;
 }
-function drawStatus() {
-  const cards = [];
-  for (const [key, label] of Object.entries(names)) {
-    const card = node("article", undefined, "card");
-    const heading = node("div", undefined, "cardhead");
-    heading.append(
-      node("h3", `${label}备份`),
-      node("span", model.phases[key], "state"),
+
+function formatTime(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatBytes(size) {
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
+  if (size < 1024) return `${size} B`;
+  if (size < 1048576) return `${(size / 1024).toFixed(1)} KiB`;
+  if (size < 1073741824) return `${(size / 1048576).toFixed(1)} MiB`;
+  return `${(size / 1073741824).toFixed(2)} GiB`;
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return `${ms} ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(1)} s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m} 分 ${s} 秒`;
+}
+
+function formatRelative(iso, future = false) {
+  if (!iso) return "—";
+  const diffSec = Math.round((new Date(iso).getTime() - Date.now()) / 1000);
+  const abs = Math.abs(future ? diffSec : -diffSec);
+  if (abs < 45) return future ? "即将执行" : "刚刚";
+  if (abs < 3600) {
+    const mins = Math.round(abs / 60);
+    return future ? `约 ${mins} 分钟后` : `${mins} 分钟前`;
+  }
+  if (abs < 86400) {
+    const hrs = Math.round(abs / 3600);
+    return future ? `约 ${hrs} 小时后` : `${hrs} 小时前`;
+  }
+  const days = Math.round(abs / 86400);
+  return future ? `约 ${days} 天后` : `${days} 天前`;
+}
+
+function showToast(message, state = "info") {
+  const toast = el("toast");
+  clearTimeout(toastTimer);
+  toast.dataset.state = state;
+  toast.textContent = message;
+  if (message && state !== "pending") {
+    toastTimer = setTimeout(
+      () => {
+        toast.textContent = "";
+      },
+      state === "error" ? 7000 : 4000,
     );
+  }
+}
+
+function hasAnyActivePhase() {
+  return Boolean(
+    model && Object.values(model.phases || {}).some((p) => p !== "空闲"),
+  );
+}
+
+function summarizeHost(urlText, remoteDir) {
+  if (!urlText) return "未配置服务地址";
+  try {
+    const parsed = new URL(urlText);
+    const base = `${parsed.host}${parsed.pathname.replace(/\/$/, "")}`;
+    const dir = (remoteDir || "/").trim();
+    if (!dir || dir === "/") return base || parsed.host;
+    return `${base}/${dir.replace(/^\/+|\/+$/g, "")}`;
+  } catch {
+    return urlText;
+  }
+}
+
+function renderTopHealth() {
+  const badge = el("health-badge");
+  const phases = Object.values(model.phases || {});
+  const running = phases.some((p) => p !== "空闲");
+  const planErrs = Object.keys(model.plan_errors || {}).length > 0;
+  const latestLocal = model.history.find((r) => r.mode === "local");
+  const latestRemote = model.history.find((r) => r.mode === "webdav");
+  const anyFail =
+    (latestLocal && !latestLocal.ok) || (latestRemote && !latestRemote.ok);
+  const enabledCount = ["local", "webdav"].filter(
+    (m) => model.settings[`${m}_enabled`],
+  ).length;
+
+  badge.className = "pill";
+  if (running) {
+    badge.classList.add("pill-info", "pill-pulse");
+    badge.textContent = "备份运行中";
+  } else if (planErrs || anyFail) {
+    badge.classList.add("pill-err");
+    badge.textContent = planErrs ? "计划配置异常" : "最近备份异常";
+  } else if (enabledCount === 0) {
+    badge.classList.add("pill-warn");
+    badge.textContent = "定时计划未启用";
+  } else {
+    badge.classList.add("pill-ok");
+    badge.textContent = "运行正常";
+  }
+
+  if (lastSyncAt) {
+    el("last-sync").textContent = `更新于 ${lastSyncAt.toLocaleTimeString("zh-CN", { hour12: false })}`;
+  }
+}
+
+function renderKpis() {
+  const history = model.history || [];
+  const lastOk = history.find((r) => r.ok);
+  const localLast = history.find((r) => r.mode === "local");
+  const webdavLast = history.find((r) => r.mode === "webdav");
+
+  // KPI 1: Latest successful backup
+  const kpiLast = node("article", undefined, "kpi-card");
+  kpiLast.append(node("span", "最近成功备份", "kpi-label"));
+  const lastVal = node(
+    "div",
+    lastOk ? formatRelative(lastOk.time, false) : "尚未成功",
+    `kpi-value ${lastOk ? "tone-ok" : "tone-warn"}`,
+  );
+  const statusOf = (rec) => (!rec ? "未运行" : rec.ok ? "正常" : "失败");
+  kpiLast.append(
+    lastVal,
+    node(
+      "span",
+      `本地：${statusOf(localLast)} · WebDAV：${statusOf(webdavLast)}`,
+      "kpi-sub",
+    ),
+  );
+
+  // KPI 2: Next scheduled execution
+  const enabledModes = ["local", "webdav"].filter(
+    (m) => model.settings[`${m}_enabled`],
+  );
+  const upcoming = Object.entries(model.next || {})
+    .map(([k, iso]) => ({ mode: k, iso, ts: new Date(iso).getTime() }))
+    .sort((a, b) => a.ts - b.ts);
+  const soonest = upcoming[0];
+  const kpiNext = node("article", undefined, "kpi-card");
+  kpiNext.append(node("span", "下次计划执行", "kpi-label"));
+  const nextVal = node(
+    "div",
+    soonest ? formatRelative(soonest.iso, true) : "未启用",
+    `kpi-value ${soonest ? "" : "tone-warn"}`,
+  );
+  kpiNext.append(
+    nextVal,
+    node(
+      "span",
+      soonest
+        ? `${NAMES[soonest.mode]} · ${formatTime(soonest.iso)}（已启用 ${enabledModes.length}/2）`
+        : `已启用 ${enabledModes.length}/2 项定时计划`,
+      "kpi-sub",
+    ),
+  );
+
+  // KPI 3: Success rate & mini dot strip
+  const total = history.length;
+  const okCount = history.filter((r) => r.ok).length;
+  const rate = total
+    ? ((okCount / total) * 100).toFixed(okCount === total || okCount === 0 ? 0 : 1)
+    : null;
+  const kpiRate = node("article", undefined, "kpi-card");
+  kpiRate.append(node("span", `近期成功率（近 ${total} 次）`, "kpi-label"));
+  const rateTone =
+    rate === null ? "" : okCount === total ? "tone-ok" : okCount === 0 ? "tone-err" : "tone-warn";
+  kpiRate.append(
+    node("div", rate === null ? "—" : `${rate}%`, `kpi-value ${rateTone}`),
+  );
+  if (total > 0) {
+    const dots = node("div", undefined, "spark-dots");
+    const recent = history.slice(0, 15).reverse();
+    for (const item of recent) {
+      const dot = node("span", undefined, `spark-dot ${item.ok ? "ok" : "fail"}`);
+      dot.title = `${NAMES[item.mode]} · ${item.ok ? "成功" : "失败"} · ${formatTime(item.time)}`;
+      dots.append(dot);
+    }
+    kpiRate.append(dots);
+  } else {
+    kpiRate.append(node("span", "完成首次备份后展示运行趋势", "kpi-sub"));
+  }
+
+  // KPI 4: Local storage usage
+  const storage = model.local_storage || {
+    total_count: 0,
+    total_size: 0,
+    plugin_count: 0,
+    plugin_size: 0,
+  };
+  const kpiStore = node("article", undefined, "kpi-card");
+  kpiStore.append(node("span", "本地备份占用", "kpi-label"));
+  kpiStore.append(
+    node("div", formatBytes(storage.total_size), "kpi-value"),
+    node(
+      "span",
+      `data/backups 共 ${storage.total_count} 份 ZIP（本插件 ${storage.plugin_count} 份）`,
+      "kpi-sub",
+    ),
+  );
+
+  el("kpi-grid").replaceChildren(kpiLast, kpiNext, kpiRate, kpiStore);
+}
+
+function renderCards() {
+  const cards = [];
+  for (const key of ["local", "webdav"]) {
+    const label = NAMES[key];
+    const phase = model.phases[key] || "空闲";
+    const isRunning = phase !== "空闲";
     const last = model.history.find((x) => x.mode === key);
-    const result = last
+    const planErr = model.plan_errors[key];
+    const enabled = Boolean(model.settings[`${key}_enabled`]);
+    const keepCount = Number(model.settings[`${key}_keep_count`] || 0);
+    const includeTemp = Boolean(model.settings[`${key}_items`]);
+
+    const card = node("article", undefined, "card");
+
+    // Header
+    const head = node("div", undefined, "card-head");
+    const titleWrap = node("div", undefined, "card-title");
+    titleWrap.append(node("h2", `${label}备份`));
+    const pillClass = isRunning
+      ? "pill pill-info pill-pulse"
+      : planErr
+        ? "pill pill-err"
+        : last && !last.ok
+          ? "pill pill-err"
+          : last && last.ok
+            ? "pill pill-ok"
+            : "pill pill-neutral";
+    const pillText = isRunning
+      ? phase
+      : planErr
+        ? "计划无效"
+        : last
+          ? last.ok
+            ? "上次成功"
+            : "上次失败"
+          : "空闲";
+    head.append(titleWrap, node("span", pillText, pillClass));
+    card.append(head);
+
+    // Metric Row
+    const metricRow = node("div", undefined, "card-metric-row");
+    const metricText = last
       ? last.ok
-        ? bytes(last.size)
+        ? formatBytes(last.size)
         : "备份失败"
       : "尚未运行";
-    const next =
-      model.plan_errors[key] ||
-      (model.next[key]
-        ? `下次运行 ${time(model.next[key])}`
-        : "定时备份已关闭");
-    const run = node("button", `立即备份到${label}`);
-    run.disabled = model.phases[key] !== "空闲";
-    run.onclick = async () => {
-      run.disabled = true;
+    const metricCls = last
+      ? last.ok
+        ? "metric"
+        : "metric is-err"
+      : "metric is-muted";
+    metricRow.append(
+      node("div", metricText, metricCls),
+      node(
+        "span",
+        last ? `最近运行 ${formatRelative(last.time, false)}` : "等待首次执行",
+        "metric-time",
+      ),
+    );
+    card.append(metricRow);
+
+    // Live progress indicator when active
+    if (isRunning) {
+      const box = node("div", undefined, "progress-box");
+      const pHead = node("div", undefined, "progress-head");
+      const startedIso = model.phase_started?.[key];
+      const elapsedEl = node("span", "", "elapsed-timer");
+      elapsedEl.dataset.started = startedIso || "";
+      elapsedEl.textContent = startedIso
+        ? `已运行 ${Math.max(0, Math.floor((Date.now() - new Date(startedIso).getTime()) / 1000))}s`
+        : "";
+      pHead.append(node("span", `阶段：${phase}`), elapsedEl);
+      const track = node("div", undefined, "progress-track");
+      track.append(node("div", undefined, "progress-bar"));
+      box.append(pHead, track);
+      card.append(box);
+    }
+
+    // Config Summary Grid
+    const meta = node("div", undefined, "meta-grid");
+    const addMeta = (k, v, isErr = false) => {
+      const item = node("div", undefined, "meta-item");
+      item.append(
+        node("span", k, "meta-key"),
+        node("span", v, `meta-val${isErr ? " is-err" : ""}`),
+      );
+      item.lastChild.title = v;
+      meta.append(item);
+    };
+
+    if (planErr) {
+      addMeta("定时计划", planErr, true);
+    } else if (enabled && model.next[key]) {
+      addMeta("定时计划", `${model.settings[`${key}_cron`]} · ${formatRelative(model.next[key], true)}`);
+    } else {
+      addMeta("定时计划", "已关闭（仅手动）");
+    }
+
+    addMeta(
+      "保留策略",
+      keepCount > 0 ? `自动保留最新 ${keepCount} 份` : "不自动清理",
+    );
+
+    addMeta("备份范围", includeTemp ? "常规项目 + temp" : "常规项目（不含 temp）");
+
+    if (key === "local") {
+      addMeta("保存位置", "data/backups/");
+    } else {
+      const targetText = summarizeHost(
+        model.settings.url,
+        model.settings.remote_dir,
+      );
+      const pwdTag = model.password_set ? "已填密码" : "未填密码";
+      addMeta(
+        "远端目标",
+        model.settings.url ? `${targetText} · ${pwdTag}` : "未配置 WebDAV",
+        !model.settings.url,
+      );
+    }
+    card.append(meta);
+
+    // Card Actions
+    const actions = node("div", undefined, "card-actions");
+    const runBtn = node("button", `立即备份`, "btn btn-tonal");
+    runBtn.type = "button";
+    runBtn.disabled = isRunning;
+    runBtn.onclick = async () => {
+      runBtn.disabled = true;
       try {
         await bridge.apiPost("run", { mode: key });
-        notice(`${label}任务已提交，使用已保存的设置。`);
+        showToast(`${label}备份任务已提交`, "info");
         await refresh();
+        scheduleNextPoll();
       } catch (err) {
-        notice(err.message, true);
-        run.disabled = false;
+        showToast(err.message || "提交备份失败", "error");
+        runBtn.disabled = false;
       }
     };
-    card.append(
-      heading,
-      node("p", result, "metric"),
-      node(
-        "p",
-        last
-          ? `最近运行 ${time(last.time)}`
-          : key === "local"
-            ? "保存到 data/backups"
-            : "上传到已配置的远程目录",
-        "secondary",
-      ),
-      node("p", next, "secondary"),
-      run,
-    );
+    actions.append(runBtn);
+
+    if (key === "webdav") {
+      const testBtn = node("button", "测试连接", "btn btn-sm");
+      testBtn.type = "button";
+      testBtn.onclick = async () => {
+        if (!model.settings.url) {
+          showToast("请先填写 WebDAV 服务地址", "error");
+          openSettingsFor("webdav");
+          return;
+        }
+        testBtn.disabled = true;
+        testBtn.textContent = "测试中…";
+        showToast("正在测试已保存的 WebDAV 连接…", "pending");
+        try {
+          await bridge.apiPost("test-connection", {
+            url: model.settings.url,
+            remote_dir: model.settings.remote_dir,
+            username: model.settings.username,
+            allow_http: Boolean(model.settings.allow_http),
+          });
+          showToast("WebDAV 连接测试通过（写入、校验并清理成功）", "success");
+        } catch (err) {
+          showToast(`连接测试失败：${err.message || "请检查配置"}`, "error");
+        } finally {
+          testBtn.disabled = false;
+          testBtn.textContent = "测试连接";
+        }
+      };
+      actions.append(testBtn);
+    }
+
+    const cfgBtn = node("button", "配置", "btn btn-sm spacer");
+    cfgBtn.type = "button";
+    cfgBtn.onclick = () => openSettingsFor(key);
+    actions.append(cfgBtn);
+
+    card.append(actions);
     cards.push(card);
   }
   el("cards").replaceChildren(...cards);
-  const rows = model.history.map((r) => {
-    const row = node("div", undefined, "run"),
-      info = node("div");
-    const result = !r.ok ? "失败" : r.mode === "webdav"
-      ? (r.remote ? "成功（已校验）" : "成功（旧版未校验）") : "成功";
-    info.append(
-      node("b", `${names[r.mode]} · ${result}`),
-      node("small", `${time(r.time)} · ${r.ok ? r.name : r.error}`),
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    showToast("已复制到剪贴板", "success");
+  } catch {
+    showToast("复制失败，请手动选中复制", "error");
+  }
+}
+
+function renderHistory() {
+  const all = model.history || [];
+  el("history-count").textContent = String(all.length);
+
+  const filtered = all.filter((r) => {
+    if (filterMode !== "all" && r.mode !== filterMode) return false;
+    if (filterStatus === "ok" && !r.ok) return false;
+    if (filterStatus === "fail" && r.ok) return false;
+    return true;
+  });
+
+  if (!filtered.length) {
+    const msg = all.length
+      ? "当前筛选条件下没有匹配的运行记录。"
+      : "完成首次备份后，这里会显示时间、耗时、文件大小和运行结果。";
+    el("history").replaceChildren(node("p", msg, "empty"));
+    return;
+  }
+
+  const rows = filtered.map((r) => {
+    const row = node("div", undefined, "run-row");
+    const main = node("div", undefined, "run-main");
+
+    // Head row with badges
+    const head = node("div", undefined, "run-head");
+    const statusText = !r.ok
+      ? "失败"
+      : r.mode === "webdav"
+        ? r.remote
+          ? "成功 · 已校验"
+          : "成功 · 旧版未校验"
+        : "成功";
+    head.append(
+      node("span", statusText, `pill ${r.ok ? "pill-ok" : "pill-err"}`),
+      node("span", NAMES[r.mode] || r.mode, "tag tag-accent"),
     );
-    if (r.remote) info.append(node("small", `远端目标：${r.remote}`));
-    row.append(info, node("strong", r.ok ? bytes(r.size) : ""));
+    if (r.trigger) {
+      head.append(
+        node("span", r.trigger === "schedule" ? "定时触发" : "手动触发", "tag"),
+      );
+    }
+    if (r.include_temp) {
+      head.append(node("span", "含 temp", "tag"));
+    }
+    if (r.pruned > 0) {
+      head.append(node("span", `已清理 ${r.pruned} 份旧备份`, "tag"));
+    }
+    if (r.prune_error) {
+      head.append(node("span", "清理警告", "tag tag-warn"));
+    }
+    main.append(head);
+
+    // Time & duration
+    const subParts = [formatTime(r.time)];
+    if (Number.isFinite(r.duration_ms)) {
+      subParts.push(`耗时 ${formatDuration(r.duration_ms)}`);
+    }
+    main.append(node("div", subParts.join(" · "), "run-sub"));
+
+    // Path / Remote URL with Copy
+    const targetText = r.remote || r.name;
+    if (targetText) {
+      const pathRow = node("div", undefined, "run-path-row");
+      pathRow.append(node("code", targetText, "run-path"));
+      const copyBtn = node("button", "复制", "copy-btn");
+      copyBtn.type = "button";
+      copyBtn.onclick = () => copyText(targetText);
+      pathRow.append(copyBtn);
+      main.append(pathRow);
+    }
+
+    if (!r.ok && r.error) {
+      main.append(node("div", `失败原因：${r.error}`, "callout callout-err"));
+    }
+    if (r.prune_error) {
+      main.append(
+        node(
+          "div",
+          `备份已成功，但自动清理旧备份失败：${r.prune_error}`,
+          "callout callout-warn",
+        ),
+      );
+    }
+
+    row.append(
+      main,
+      node("div", r.ok ? formatBytes(r.size) : "—", "run-size"),
+    );
     return row;
   });
-  el("history").replaceChildren(
-    ...(rows.length
-      ? rows
-      : [
-          node(
-            "p",
-            "完成首次备份后，这里会显示时间、文件大小和运行结果。",
-            "empty",
-          ),
-        ]),
-  );
+
+  el("history").replaceChildren(...rows);
 }
+
+function updateDirtyIndicators() {
+  const anyDirty = Boolean(drafts.local || drafts.webdav);
+  el("settings-dirty-dot").hidden = !anyDirty;
+  for (const m of ["local", "webdav"]) {
+    const dot = document.querySelector(`[data-dirty="${m}"]`);
+    if (dot) dot.hidden = !drafts[m];
+  }
+  el("discard-draft").hidden = !drafts[mode];
+  el("save-feedback").textContent = drafts[mode] ? "当前目标有未保存的更改" : "";
+}
+
 function collect() {
   const values = {};
-  for (const key of ["enabled", "cron", "timezone"])
+  for (const key of ["enabled", "cron", "timezone"]) {
     values[`${mode}_${key}`] =
       key === "enabled" ? el(key).checked : el(key).value.trim();
+  }
   values[`${mode}_items`] = el("include-temp").checked;
+  const rawKeep = el("keep-count").value.trim();
+  values[`${mode}_keep_count`] = /^\d+$/.test(rawKeep) ? Number(rawKeep) : -1;
   if (mode === "webdav") {
-    for (const key of ["url", "remote_dir", "username"]) values[key] = el(key).value.trim();
+    for (const key of ["url", "remote_dir", "username"]) {
+      values[key] = el(key).value.trim();
+    }
     values.allow_http = el("allow_http").checked;
     if (el("password").value) values.password = el("password").value;
   }
   return values;
 }
-let saveToastTimer;
-function showSaveToast(message, state) {
-  const toast = el("save-toast");
-  clearTimeout(saveToastTimer);
-  toast.dataset.state = state;
-  toast.textContent = message;
-  if (state !== "pending") {
-    saveToastTimer = setTimeout(() => {
-      toast.textContent = "";
-    }, state === "error" ? 8000 : 5000);
+
+async function fetchCronPreview() {
+  const box = el("cron-preview");
+  const cron = el("cron").value.trim();
+  const tz = el("timezone").value.trim();
+  if (!cron || !tz) {
+    box.className = "preview-box is-err";
+    box.textContent = "请填写 Cron 表达式和时区以预览执行时间。";
+    return;
+  }
+  try {
+    const res = await bridge.apiPost("cron-preview", {
+      cron,
+      timezone: tz,
+      count: 3,
+    });
+    const runs = res?.next_runs || [];
+    box.className = "preview-box";
+    box.replaceChildren(node("div", "未来 3 次预计执行时间："));
+    const list = node("div", undefined, "preview-list");
+    for (const iso of runs) {
+      list.append(node("span", formatTime(iso)));
+    }
+    box.append(list);
+  } catch (err) {
+    box.className = "preview-box is-err";
+    box.textContent = err.message || "Cron 表达式或时区无效";
   }
 }
+
+function scheduleCronPreview() {
+  clearTimeout(cronPreviewTimer);
+  cronPreviewTimer = setTimeout(fetchCronPreview, 250);
+}
+
+function syncPresetChips() {
+  const curCron = el("cron").value.trim();
+  for (const btn of document.querySelectorAll("[data-cron]")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.cron === curCron));
+  }
+  const curKeep = el("keep-count").value.trim();
+  for (const btn of document.querySelectorAll("[data-keep]")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.keep === curKeep));
+  }
+}
+
 function drawForm() {
+  if (!model) return;
   const conf = { ...model.settings, ...drafts[mode] };
-  el("settings").hidden = false;
-  for (const b of document.querySelectorAll("[data-mode]"))
-    b.setAttribute("aria-pressed", b.dataset.mode === mode);
-  el("plan-title").textContent = `${names[mode]}计划`;
-  el("save").textContent = `保存${names[mode]}设置`;
-  el("enabled").checked = conf[`${mode}_enabled`];
-  for (const key of ["cron", "timezone"])
-    el(key).value = conf[`${mode}_${key}`];
+  for (const b of document.querySelectorAll("[data-mode]")) {
+    b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
+  }
+  el("plan-title").textContent = `${NAMES[mode]}定时计划`;
+  el("save").textContent = `保存${NAMES[mode]}设置`;
+  el("enabled").checked = Boolean(conf[`${mode}_enabled`]);
+  el("cron").value = conf[`${mode}_cron`] || "";
+  el("timezone").value = conf[`${mode}_timezone`] || "Asia/Shanghai";
+  el("keep-count").value = String(conf[`${mode}_keep_count`] ?? 0);
+  el("keep-help").textContent =
+    mode === "local"
+      ? "每次本地备份完成后，仅保留由本插件生成的最新 N 份 ZIP，不影响手动上传或原生备份。填 0 表示不自动清理。"
+      : "每次 WebDAV 备份校验成功后，自动清理远程目录中超出 N 份的本插件历史 ZIP（需服务器支持 PROPFIND 与 DELETE）。填 0 表示不自动清理。";
+
   el("test-connection").hidden = mode !== "webdav";
   el("remote").hidden = mode !== "webdav";
   el("remote").disabled = mode !== "webdav";
-  for (const key of ["url", "remote_dir", "username", "password"])
+  for (const key of ["url", "remote_dir", "username", "password"]) {
     el(key).value = conf[key] || "";
+  }
   el("password").placeholder = model.password_set
-    ? "已设置，留空保留"
-    : "输入应用密码";
-  el("allow_http").checked = conf.allow_http;
-  el("include-temp").checked = conf[`${mode}_items`];
-  el("save-feedback").textContent = drafts[mode] ? "有未保存的更改" : "";
+    ? "已保存密码，留空则保持不变"
+    : "直接输入 WebDAV 密码";
+  el("allow_http").checked = Boolean(conf.allow_http);
+  el("include-temp").checked = Boolean(conf[`${mode}_items`]);
+
+  syncPresetChips();
+  updateDirtyIndicators();
+  fetchCronPreview();
 }
+
+function switchTab(nextTab) {
+  activeTab = nextTab;
+  for (const btn of document.querySelectorAll("[data-tab]")) {
+    const selected = btn.dataset.tab === nextTab;
+    btn.setAttribute("aria-selected", String(selected));
+  }
+  el("tab-history").hidden = nextTab !== "history";
+  el("tab-settings").hidden = nextTab !== "settings";
+  if (nextTab === "settings") {
+    drawForm();
+  }
+}
+
+function openSettingsFor(targetMode) {
+  mode = targetMode;
+  switchTab("settings");
+  el("tab-settings").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderAll() {
+  if (!model) return;
+  renderTopHealth();
+  renderKpis();
+  renderCards();
+  renderHistory();
+  updateDirtyIndicators();
+}
+
+function scheduleNextPoll() {
+  clearTimeout(pollTimer);
+  const delay = hasAnyActivePhase() ? 2500 : 10000;
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden && !busy) {
+      await refresh().catch((err) => showToast(err.message, "error"));
+    }
+    scheduleNextPoll();
+  }, delay);
+}
+
 async function refresh() {
   if (loading) return;
   loading = true;
   try {
     model = await bridge.apiGet("dashboard");
-    drawStatus();
+    lastSyncAt = new Date();
+    renderAll();
   } finally {
     loading = false;
   }
 }
-el("form").oninput = () => {
-  drafts[mode] = collect();
-  el("save-feedback").textContent = "有未保存的更改";
-};
-el("form").addEventListener("invalid", (event) => {
-  if (event.target === el("form").querySelector("input:invalid")) {
-    const label = event.target.labels[0].textContent.trim();
-    showSaveToast(`请检查${label}。${event.target.validationMessage}`, "error");
+
+// Event bindings
+el("refresh-btn").onclick = async () => {
+  el("refresh-btn").disabled = true;
+  try {
+    await refresh();
+    showToast("状态已刷新", "info");
+  } catch (err) {
+    showToast(err.message || "刷新失败", "error");
+  } finally {
+    el("refresh-btn").disabled = false;
   }
-}, true);
-for (const b of document.querySelectorAll("[data-mode]"))
-  b.onclick = () => {
+};
+
+el("open-settings-btn").onclick = () => openSettingsFor(mode);
+
+for (const btn of document.querySelectorAll("[data-tab]")) {
+  btn.onclick = () => switchTab(btn.dataset.tab);
+}
+
+for (const btn of document.querySelectorAll("[data-filter-mode]")) {
+  btn.onclick = () => {
+    filterMode = btn.dataset.filterMode;
+    for (const b of document.querySelectorAll("[data-filter-mode]")) {
+      b.setAttribute("aria-pressed", String(b.dataset.filterMode === filterMode));
+    }
+    if (model) renderHistory();
+  };
+}
+
+for (const btn of document.querySelectorAll("[data-filter-status]")) {
+  btn.onclick = () => {
+    filterStatus = btn.dataset.filterStatus;
+    for (const b of document.querySelectorAll("[data-filter-status]")) {
+      b.setAttribute(
+        "aria-pressed",
+        String(b.dataset.filterStatus === filterStatus),
+      );
+    }
+    if (model) renderHistory();
+  };
+}
+
+for (const btn of document.querySelectorAll("[data-mode]")) {
+  btn.onclick = () => {
     if (!busy) {
-      mode = b.dataset.mode;
+      mode = btn.dataset.mode;
       drawForm();
     }
   };
+}
+
+for (const btn of document.querySelectorAll("[data-cron]")) {
+  btn.onclick = () => {
+    el("cron").value = btn.dataset.cron;
+    drafts[mode] = collect();
+    syncPresetChips();
+    updateDirtyIndicators();
+    fetchCronPreview();
+  };
+}
+
+for (const btn of document.querySelectorAll("[data-keep]")) {
+  btn.onclick = () => {
+    el("keep-count").value = btn.dataset.keep;
+    drafts[mode] = collect();
+    syncPresetChips();
+    updateDirtyIndicators();
+  };
+}
+
+el("form").oninput = (event) => {
+  drafts[mode] = collect();
+  syncPresetChips();
+  updateDirtyIndicators();
+  if (event.target === el("cron") || event.target === el("timezone")) {
+    scheduleCronPreview();
+  }
+};
+
+el("discard-draft").onclick = () => {
+  delete drafts[mode];
+  drawForm();
+  showToast("已恢复为上次保存的设置", "info");
+};
+
+el("form").addEventListener(
+  "invalid",
+  (event) => {
+    if (event.target === el("form").querySelector("input:invalid")) {
+      const label = event.target.labels?.[0]?.textContent?.trim() || "输入项";
+      showToast(`请检查${label}：${event.target.validationMessage}`, "error");
+    }
+  },
+  true,
+);
+
 el("test-connection").onclick = el("form").onsubmit = async (event) => {
   event.preventDefault();
   if (busy) return;
   const testing = event.currentTarget === el("test-connection");
   const values = collect();
   if (testing && (!values.url || !el("url").validity.valid)) {
-    showSaveToast("请填写有效的 WebDAV 服务地址。", "error");
+    showToast("请填写有效的 WebDAV 服务地址。", "error");
     el("url").focus();
     return;
   }
+  if (!testing && (values[`${mode}_keep_count`] < 0 || values[`${mode}_keep_count`] > 1000)) {
+    showToast("保留份数需填写 0 到 1000 之间的整数。", "error");
+    el("keep-count").focus();
+    return;
+  }
+
   busy = true;
   el("save").disabled = true;
   el("test-connection").disabled = true;
+  el("discard-draft").disabled = true;
   if (testing) {
     el("test-connection").textContent = "测试中…";
-    showSaveToast("正在测试 WebDAV 写入和校验…", "pending");
+    showToast("正在测试 WebDAV 写入和校验…", "pending");
   } else {
     el("save").textContent = "正在保存…";
-    showSaveToast(`正在保存${names[mode]}设置…`, "pending");
+    showToast(`正在保存${NAMES[mode]}设置…`, "pending");
   }
-  for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
+  for (const control of document.querySelectorAll(
+    "#form fieldset, [data-mode]",
+  )) {
     control.disabled = true;
+  }
   try {
     if (testing) {
-      const {url, remote_dir, username, password, allow_http} = values;
-      await bridge.apiPost("test-connection", {url, remote_dir, username, password, allow_http});
-      showSaveToast("连接成功，测试文件已写入、校验并删除。", "success");
+      const { url, remote_dir, username, password, allow_http } = values;
+      await bridge.apiPost("test-connection", {
+        url,
+        remote_dir,
+        username,
+        password,
+        allow_http,
+      });
+      showToast("连接成功，测试文件已写入、校验并删除。", "success");
       return;
     }
     await bridge.apiPost("settings", values);
@@ -207,35 +832,56 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
     if (values.password) model.password_set = true;
     delete drafts[mode];
     drawForm();
-    showSaveToast(`${names[mode]}设置已保存`, "success");
+    showToast(`${NAMES[mode]}设置已保存`, "success");
   } catch (err) {
-    showSaveToast(`${testing ? "连接测试" : "保存"}失败。${err.message || "请稍后重试。"}`, "error");
+    showToast(
+      `${testing ? "连接测试" : "保存"}失败：${err.message || "请稍后重试。"}`,
+      "error",
+    );
     return;
   } finally {
     busy = false;
-    for (const control of document.querySelectorAll("#form fieldset, [data-mode]"))
+    for (const control of document.querySelectorAll(
+      "#form fieldset, [data-mode]",
+    )) {
       control.disabled = false;
+    }
     el("remote").disabled = mode !== "webdav";
     el("test-connection").disabled = false;
     el("test-connection").textContent = "测试连接";
+    el("discard-draft").disabled = false;
     el("save").disabled = false;
-    el("save").textContent = `保存${names[mode]}设置`;
+    el("save").textContent = `保存${NAMES[mode]}设置`;
   }
-  refresh().catch((err) => notice(`仪表盘刷新失败。${err.message}`, true));
+  refresh().catch((err) => showToast(`仪表盘刷新失败：${err.message}`, "error"));
 };
+
+// Tick live elapsed timers once per second without network traffic
+const tickTimer = setInterval(() => {
+  if (document.hidden) return;
+  for (const nodeEl of document.querySelectorAll(".elapsed-timer")) {
+    const iso = nodeEl.dataset.started;
+    if (iso) {
+      const sec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+      nodeEl.textContent = `已运行 ${sec}s`;
+    }
+  }
+}, 1000);
+
+// Boot
 try {
   if (!bridge) throw new Error("请从 AstrBot WebUI 的插件页面打开仪表盘。");
   await bridge.ready();
   await refresh();
-  drawForm();
-  notice("");
-  const timer = setInterval(() => {
-    if (!document.hidden && !busy)
-      refresh().catch((err) => notice(err.message, true));
-  }, 5000);
-  window.addEventListener("pagehide", () => clearInterval(timer), {
-    once: true,
-  });
+  scheduleNextPoll();
+  window.addEventListener(
+    "pagehide",
+    () => {
+      clearTimeout(pollTimer);
+      clearInterval(tickTimer);
+    },
+    { once: true },
+  );
 } catch (err) {
-  notice(err.message, true);
+  showToast(err.message || "仪表盘初始化失败", "error");
 }

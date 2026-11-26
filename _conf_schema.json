@@ -6,7 +6,7 @@
   },
   "local_cron": {
     "type": "string",
-    "description": "本地Cron 表达式",
+    "description": "本地 Cron 表达式",
     "default": "0 2 * * *"
   },
   "local_timezone": {
@@ -20,19 +20,25 @@
     "hint": "data/temp 包含运行缓存、临时图片、语音和下载文件。",
     "default": false
   },
+  "local_keep_count": {
+    "type": "int",
+    "description": "本地保留份数",
+    "hint": "最多保留由本插件生成的最新本地备份份数，填 0 表示不自动清理。",
+    "default": 0
+  },
   "webdav_enabled": {
     "type": "bool",
-    "description": "WebDAV定时备份",
+    "description": "WebDAV 定时备份",
     "default": false
   },
   "webdav_cron": {
     "type": "string",
-    "description": "WebDAVCron 表达式",
+    "description": "WebDAV Cron 表达式",
     "default": "0 3 * * *"
   },
   "webdav_timezone": {
     "type": "string",
-    "description": "WebDAV时区",
+    "description": "WebDAV 时区",
     "default": "Asia/Shanghai"
   },
   "webdav_items": {
@@ -40,6 +46,12 @@
     "description": "备份 temp 目录",
     "hint": "data/temp 包含运行缓存、临时图片、语音和下载文件。",
     "default": false
+  },
+  "webdav_keep_count": {
+    "type": "int",
+    "description": "WebDAV 保留份数",
+    "hint": "最多保留由本插件生成的最新远端备份份数，填 0 表示不自动清理（需服务器支持 PROPFIND 与 DELETE）。",
+    "default": 0
   },
   "url": {
     "type": "string",
@@ -60,10 +72,10 @@
   },
   "password": {
     "type": "string",
-    "description": "WebDAV 应用密码",
+    "description": "WebDAV 密码",
     "default": "",
     "secret": true,
-    "hint": "可改用环境变量 ASTRBOT_WEBDAV_PASSWORD。"
+    "hint": "直接填写 WebDAV 密码或应用专用密码。"
   },
   "allow_http": {
     "type": "bool",

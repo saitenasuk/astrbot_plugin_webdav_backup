@@ -336,9 +336,150 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await self.bot.test_connection()).status_code, 400)
             payload.update(url=collection, remote_dir='/空 格', allow_http=True)
             fault = 'ok'
-            for env, expected_auth in [('', 'Basic dGVzdDpzYXZlZA=='), ('env', 'Basic dGVzdDplbnY=')]:
-                with patch.dict(plugin.os.environ, ASTRBOT_WEBDAV_PASSWORD=env), patch.object(
-                    plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))
-                ):
-                    self.assertEqual((await self.bot.test_connection()).status_code, 200)
-                    self.assertEqual(auth[-1], expected_auth)
+            with patch.object(
+                plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=payload))
+            ):
+                self.assertEqual((await self.bot.test_connection()).status_code, 200)
+                self.assertEqual(auth[-1], 'Basic dGVzdDpzYXZlZA==')
+
+    async def test_local_retention_and_storage_metrics(self):
+        backups = self.data / 'backups'
+        backups.mkdir(exist_ok=True)
+        other = backups / 'native_manual.zip'
+        old_one = backups / 'astrbot_backup_20250101_000000_local_000000000001.zip'
+        old_two = backups / 'astrbot_backup_20250102_000000_local_000000000002.zip'
+        for path in (other, old_one, old_two):
+            path.write_bytes(b'zip-data')
+
+        for bad in (-1, 1001, True, '2'):
+            with self.subTest(bad=bad), patch.object(
+                plugin,
+                'request',
+                SimpleNamespace(json=AsyncMock(return_value={'local_keep_count': bad})),
+            ):
+                self.assertEqual((await self.bot.settings()).status_code, 400)
+
+        with patch.object(
+            plugin,
+            'request',
+            SimpleNamespace(json=AsyncMock(return_value={'local_keep_count': 2})),
+        ):
+            self.assertEqual((await self.bot.settings()).status_code, 200)
+
+        await self.bot._backup('local', trigger='schedule')
+        record = self.bot.history[0]
+        self.assertTrue(record['ok'], record)
+        self.assertEqual(record['trigger'], 'schedule')
+        self.assertEqual(record['pruned'], 1)
+        self.assertGreaterEqual(record['duration_ms'], 0)
+        self.assertTrue(other.exists())
+        self.assertFalse(old_one.exists())
+        self.assertTrue(old_two.exists())
+        self.assertTrue((backups / record['name']).exists())
+
+        status = json.loads((await self.bot.dashboard()).body)
+        self.assertEqual(status['local_storage']['total_count'], 3)
+        self.assertEqual(status['local_storage']['plugin_count'], 2)
+
+    async def test_webdav_retention_prunes_plugin_files_and_handles_delete_error(self):
+        prefix = '/mount/dav/%E7%A9%BA%20%E6%A0%BC/'
+        files = {
+            'keep_other.zip': b'keep',
+            'astrbot_backup_20250101_000000_webdav_000000000001.zip': b'old1',
+            'astrbot_backup_20250102_000000_webdav_000000000002.zip': b'old2',
+        }
+        fail_delete = False
+
+        async def handle(request):
+            name = request.match_info['name']
+            if request.method == 'PUT':
+                files[name] = await request.read()
+                return web.Response(status=201)
+            if request.method == 'PROPFIND':
+                if name:
+                    return properties(request.raw_path, len(files[name]))
+                entries = [
+                    f'<D:response><D:href>{prefix}</D:href>'
+                    '<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>'
+                    '<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>',
+                    f'<D:response><D:href>{prefix}subdir/</D:href>'
+                    '<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>'
+                    '<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>',
+                ]
+                for fname, content in files.items():
+                    entries.append(
+                        f'<D:response><D:href>{prefix}{escape(fname)}</D:href>'
+                        f'<D:propstat><D:prop><D:getcontentlength>{len(content)}</D:getcontentlength></D:prop>'
+                        '<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+                    )
+                return web.Response(
+                    status=207,
+                    content_type='application/xml',
+                    text=f'<D:multistatus xmlns:D="DAV:">{"".join(entries)}</D:multistatus>',
+                )
+            if request.method == 'DELETE':
+                if fail_delete:
+                    return web.Response(status=403)
+                del files[name]
+                return web.Response(status=204)
+            return web.Response(status=405)
+
+        app = web.Application()
+        app.router.add_route('*', '/mount/dav/空 格/{name:.*}', handle)
+        async with TestServer(app) as server:
+            self.config.update(
+                url=str(server.make_url('/mount/dav/')),
+                remote_dir='/空 格',
+                username='backup',
+                password='secret',
+                allow_http=True,
+                webdav_keep_count=2,
+            )
+            await self.bot._backup('webdav')
+            first = self.bot.history[0]
+            self.assertTrue(first['ok'], first)
+            self.assertEqual(first['pruned'], 1)
+            self.assertIn('keep_other.zip', files)
+            self.assertNotIn(
+                'astrbot_backup_20250101_000000_webdav_000000000001.zip', files
+            )
+            self.assertIn(
+                'astrbot_backup_20250102_000000_webdav_000000000002.zip', files
+            )
+            self.assertIn(first['name'], files)
+
+            fail_delete = True
+            await self.bot._backup('webdav')
+            second = self.bot.history[0]
+            self.assertTrue(second['ok'], second)
+            self.assertIn('403', second['prune_error'])
+
+    async def test_cron_preview(self):
+        with patch.object(
+            plugin,
+            'request',
+            SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        'cron': '0 3 * * *',
+                        'timezone': 'Asia/Shanghai',
+                        'count': 3,
+                    }
+                )
+            ),
+        ):
+            res = await self.bot.cron_preview()
+        self.assertEqual(res.status_code, 200)
+        runs = json.loads(res.body)['next_runs']
+        self.assertEqual(len(runs), 3)
+        self.assertEqual(runs, sorted(runs))
+
+        for bad in (
+            {'cron': 'invalid', 'timezone': 'Asia/Shanghai'},
+            {'cron': '0 3 * * *', 'timezone': 'Invalid/Zone'},
+            {'cron': '0 3 * * *', 'timezone': 'Asia/Shanghai', 'count': 99},
+        ):
+            with self.subTest(bad=bad), patch.object(
+                plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=bad))
+            ):
+                self.assertEqual((await self.bot.cron_preview()).status_code, 400)

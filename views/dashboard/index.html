@@ -1,6 +1,4 @@
 <!doctype html>
-<!-- Rank the two destinations and their outcomes first, editable plans second, history third.
-     Save is the primary action. Use host surface/text/accent tokens and a 4/8/16/24/32 spacing scale. -->
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
@@ -9,95 +7,299 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <div id="save-toast" role="status" aria-atomic="true"></div>
-    <main>
-      <header>
-        <h1>备份仪表盘</h1>
-        <p>管理本地与 WebDAV 备份，在 AstrBot 的备份列表中恢复。</p>
-      </header>
-      <p id="notice" role="status" aria-live="polite">正在读取备份状态…</p>
-      <section class="destinations" aria-label="备份目标" id="cards"></section>
-      <section class="panel" id="settings" hidden>
-        <h2>备份设置</h2>
-        <div role="group" aria-label="选择设置目标" class="switch">
-          <button type="button" data-mode="local" aria-pressed="true">
-            本地</button
-          ><button type="button" data-mode="webdav" aria-pressed="false">
-            WebDAV
+    <div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+    <main class="shell">
+      <header class="topbar">
+        <div class="topbar-title">
+          <div class="title-row">
+            <h1>备份仪表盘</h1>
+            <span id="health-badge" class="pill pill-neutral">读取中…</span>
+          </div>
+          <p class="subtitle">
+            监控本地与 WebDAV 备份状态、自动保留策略与历史记录，生成 AstrBot 原生 ZIP。
+          </p>
+        </div>
+        <div class="topbar-actions">
+          <span id="last-sync" class="sync-meta"></span>
+          <button id="refresh-btn" type="button" class="btn">刷新</button>
+          <button id="open-settings-btn" type="button" class="btn btn-primary">
+            备份设置
           </button>
         </div>
-        <form id="form">
-          <fieldset>
-            <legend id="plan-title">本地计划</legend>
-            <label class="inline"
-              ><input type="checkbox" id="enabled" />启用定时备份</label
-            >
-            <div class="fields">
-              <label
-                >Cron 表达式<input
-                  type="text"
-                  id="cron"
-                  required
-                  aria-describedby="cron-help" /></label
-              ><label>时区<input type="text" id="timezone" required /></label>
+      </header>
+
+      <section class="kpi-grid" aria-label="核心指标" id="kpi-grid"></section>
+
+      <section class="destinations" aria-label="备份目标状态" id="cards"></section>
+
+      <section class="panel workspace" aria-label="工作区">
+        <div class="tabbar" role="tablist" aria-label="仪表盘视图">
+          <button
+            type="button"
+            role="tab"
+            id="tab-btn-history"
+            data-tab="history"
+            aria-selected="true"
+            aria-controls="tab-history"
+            class="tab-btn"
+          >
+            运行历史 <span id="history-count" class="tab-count">0</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-btn-settings"
+            data-tab="settings"
+            aria-selected="false"
+            aria-controls="tab-settings"
+            class="tab-btn"
+          >
+            计划与连接设置
+            <span
+              id="settings-dirty-dot"
+              class="dirty-dot"
+              hidden
+              title="有未保存更改"
+            ></span>
+          </button>
+        </div>
+
+        <div
+          id="tab-history"
+          role="tabpanel"
+          aria-labelledby="tab-btn-history"
+          class="tab-panel"
+        >
+          <div class="toolbar">
+            <div class="filter-group" role="group" aria-label="按目标筛选">
+              <button
+                type="button"
+                class="chip"
+                data-filter-mode="all"
+                aria-pressed="true"
+              >
+                全部目标
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-filter-mode="local"
+                aria-pressed="false"
+              >
+                本地
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-filter-mode="webdav"
+                aria-pressed="false"
+              >
+                WebDAV
+              </button>
             </div>
-            <small id="cron-help"
-              >分、时、日、月、星期。例如 0 3 * * * 表示每天 03:00。</small
-            >
-          </fieldset>
-          <fieldset id="remote" hidden>
-            <legend>WebDAV 连接</legend>
-            <label
-              >WebDAV 服务地址<input
-                type="url"
-                id="url"
-                placeholder="https://dav.example.com/dav/"
-            /></label>
-            <label>远程目录<input type="text" id="remote_dir" placeholder="/" aria-describedby="remote-dir-help" /></label>
-            <small id="remote-dir-help">/ 表示服务根目录，也可填写已存在的子目录，例如 /backups。</small>
-            <div class="fields">
-              <label
-                >用户名<input
-                  type="text"
-                  id="username"
-                  autocomplete="off" /></label
-              ><label
-                >应用密码<input
-                  type="password"
-                  id="password"
-                  autocomplete="new-password"
-              /></label>
-            </div>
-            <label class="inline"
-              ><input type="checkbox" id="allow_http" />允许在可信内网使用明文
-              HTTP</label
-            >
-          </fieldset>
-          <fieldset>
-            <legend>备份内容</legend>
-            <p class="baseline">
-              常规备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
-            </p>
-            <div class="item">
-              <input type="checkbox" id="include-temp" aria-describedby="temp-hint" />
-              <div>
-                <label for="include-temp"><strong>备份 temp 目录</strong></label>
-                <small id="temp-hint">data/temp 包含运行缓存、临时图片、语音和下载文件。</small>
-              </div>
-            </div>
-          </fieldset>
-          <div class="footer">
-            <span id="save-feedback" role="status" aria-atomic="true"></span>
-            <div class="actions">
-              <button id="test-connection" type="button" hidden>测试连接</button>
-              <button id="save" class="primary" type="submit">保存本地设置</button>
+            <div class="filter-group" role="group" aria-label="按结果筛选">
+              <button
+                type="button"
+                class="chip"
+                data-filter-status="all"
+                aria-pressed="true"
+              >
+                全部状态
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-filter-status="ok"
+                aria-pressed="false"
+              >
+                仅成功
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-filter-status="fail"
+                aria-pressed="false"
+              >
+                仅失败
+              </button>
             </div>
           </div>
-        </form>
-      </section>
-      <section class="panel">
-        <h2>最近运行</h2>
-        <div id="history"><p>正在读取…</p></div>
+          <div id="history" class="history-list">
+            <p class="empty">正在读取运行记录…</p>
+          </div>
+        </div>
+
+        <div
+          id="tab-settings"
+          role="tabpanel"
+          aria-labelledby="tab-btn-settings"
+          class="tab-panel"
+          hidden
+        >
+          <div class="settings-head">
+            <div role="group" aria-label="选择配置目标" class="segmented">
+              <button type="button" data-mode="local" aria-pressed="true">
+                本地备份
+                <span class="dirty-dot" data-dirty="local" hidden></span>
+              </button>
+              <button type="button" data-mode="webdav" aria-pressed="false">
+                WebDAV 备份
+                <span class="dirty-dot" data-dirty="webdav" hidden></span>
+              </button>
+            </div>
+            <p class="settings-tip">
+              两个目标独立配置定时计划、保留份数与备份范围。
+            </p>
+          </div>
+
+          <form id="form">
+            <fieldset class="form-section">
+              <legend id="plan-title">本地定时计划</legend>
+              <label class="check-row">
+                <input type="checkbox" id="enabled" />
+                <span>启用定时备份</span>
+              </label>
+              <div class="presets-row" aria-label="常用定时预设">
+                <span class="presets-label">快捷预设：</span>
+                <button type="button" class="chip" data-cron="0 2 * * *">
+                  每天 02:00
+                </button>
+                <button type="button" class="chip" data-cron="0 3 * * *">
+                  每天 03:00
+                </button>
+                <button type="button" class="chip" data-cron="0 */12 * * *">
+                  每 12 小时
+                </button>
+                <button type="button" class="chip" data-cron="0 3 * * sun">
+                  每周日 03:00
+                </button>
+              </div>
+              <div class="fields">
+                <label>
+                  Cron 表达式
+                  <input
+                    type="text"
+                    id="cron"
+                    required
+                    aria-describedby="cron-help"
+                  />
+                </label>
+                <label>
+                  时区 (IANA)
+                  <input type="text" id="timezone" required />
+                </label>
+              </div>
+              <small id="cron-help">
+                五段格式：分 时 日 月 星期（例如 0 3 * * * 表示每天 03:00）。
+              </small>
+              <div id="cron-preview" class="preview-box" aria-live="polite"></div>
+            </fieldset>
+
+            <fieldset class="form-section">
+              <legend>自动保留策略</legend>
+              <div class="presets-row" aria-label="保留份数预设">
+                <span class="presets-label">快捷份数：</span>
+                <button type="button" class="chip" data-keep="0">不限制</button>
+                <button type="button" class="chip" data-keep="3">3 份</button>
+                <button type="button" class="chip" data-keep="7">7 份</button>
+                <button type="button" class="chip" data-keep="14">14 份</button>
+                <button type="button" class="chip" data-keep="30">30 份</button>
+              </div>
+              <div class="fields">
+                <label>
+                  最多保留份数（0 表示不自动清理）
+                  <input
+                    type="number"
+                    id="keep-count"
+                    min="0"
+                    max="1000"
+                    step="1"
+                    required
+                    aria-describedby="keep-help"
+                  />
+                </label>
+              </div>
+              <small id="keep-help"></small>
+            </fieldset>
+
+            <fieldset id="remote" class="form-section" hidden>
+              <legend>WebDAV 连接</legend>
+              <label>
+                WebDAV 服务地址
+                <input
+                  type="url"
+                  id="url"
+                  placeholder="https://dav.example.com/dav/"
+                />
+              </label>
+              <label>
+                远程目录
+                <input
+                  type="text"
+                  id="remote_dir"
+                  placeholder="/"
+                  aria-describedby="remote-dir-help"
+                />
+              </label>
+              <small id="remote-dir-help">
+                / 表示服务根目录，也可填写已存在的子目录，例如 /backups。
+              </small>
+              <div class="fields">
+                <label>
+                  用户名
+                  <input type="text" id="username" autocomplete="off" />
+                </label>
+                <label>
+                  密码
+                  <input
+                    type="password"
+                    id="password"
+                    autocomplete="new-password"
+                  />
+                </label>
+              </div>
+              <label class="check-row">
+                <input type="checkbox" id="allow_http" />
+                <span>允许在可信内网使用明文 HTTP</span>
+              </label>
+            </fieldset>
+
+            <fieldset class="form-section">
+              <legend>备份内容</legend>
+              <p class="baseline">
+                常规备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
+              </p>
+              <div class="check-card">
+                <input
+                  type="checkbox"
+                  id="include-temp"
+                  aria-describedby="temp-hint"
+                />
+                <div>
+                  <label for="include-temp"><strong>备份 temp 目录</strong></label>
+                  <small id="temp-hint">
+                    data/temp 包含运行缓存、临时图片、语音和下载文件，体积可能较大。
+                  </small>
+                </div>
+              </div>
+            </fieldset>
+
+            <div class="footer">
+              <span id="save-feedback" role="status" aria-atomic="true"></span>
+              <div class="actions">
+                <button id="discard-draft" type="button" class="btn" hidden>
+                  放弃更改
+                </button>
+                <button id="test-connection" type="button" class="btn" hidden>
+                  测试连接
+                </button>
+                <button id="save" class="btn btn-primary" type="submit">
+                  保存本地设置
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
       </section>
     </main>
     <script type="module" src="./app.js"></script>

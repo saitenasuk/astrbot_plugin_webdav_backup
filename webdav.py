@@ -278,3 +278,112 @@ async def upload(
         if probe:
             async with _request(session, "DELETE", final, (200, 204)):
                 pass
+
+
+async def prune_remote(
+    collection: str,
+    username: str,
+    password: str,
+    keep_count: int,
+    filename_pattern,
+) -> int:
+    """Remove older plugin-created backups in a WebDAV collection beyond keep_count.
+
+    Args:
+        collection: Validated URL of an existing WebDAV collection with trailing slash.
+        username: WebDAV user.
+        password: WebDAV password.
+        keep_count: Maximum number of matching backups to retain (must be > 0).
+        filename_pattern: Compiled regex matching plugin-owned backup filenames.
+
+    Returns:
+        Number of remote backup files deleted.
+
+    Raises:
+        WebDAVError: If listing or deleting old remote backups fails.
+    """
+    if keep_count <= 0:
+        return 0
+    headers = {}
+    if username:
+        encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+    timeout = aiohttp.ClientTimeout(total=120, sock_connect=30, sock_read=60)
+    collection_uri = URL(collection)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with _request(
+            session,
+            "PROPFIND",
+            collection,
+            (207,),
+            headers={
+                "Depth": "1",
+                "Content-Type": "application/xml; charset=utf-8",
+                "Cache-Control": "no-cache",
+            },
+            data=b'<propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>',
+        ) as res:
+            limit = 4 * 1024 * 1024
+            try:
+                await res.content.readexactly(limit + 1)
+            except asyncio.IncompleteReadError as exc:
+                xml = exc.partial
+            else:
+                raise WebDAVError(
+                    f"WebDAV PROPFIND Depth=1 返回的属性超过 {limit // 1024} KiB"
+                )
+        try:
+            root = ElementTree.fromstring(xml, forbid_dtd=True)
+        except (
+            ElementTree.ParseError,
+            DefusedXmlException,
+            LookupError,
+            ValueError,
+        ) as exc:
+            raise WebDAVError("WebDAV PROPFIND 列表解析失败，无法清理旧备份") from exc
+        if root.tag != "{DAV:}multistatus":
+            raise WebDAVError("WebDAV PROPFIND 缺少 DAV multistatus，无法清理旧备份")
+
+        matches: dict[str, str] = {}
+        for response in root.findall("{DAV:}response"):
+            href = (response.findtext("{DAV:}href") or "").strip()
+            if not href:
+                continue
+            try:
+                resource = collection_uri.join(URL(href))
+            except ValueError:
+                continue
+            if resource == collection_uri or str(resource).endswith("/"):
+                continue
+            if resource.origin() != collection_uri.origin():
+                continue
+            if str(resource.parent).rstrip("/") + "/" != str(collection_uri):
+                continue
+            is_collection = False
+            for propstat in response.findall("{DAV:}propstat"):
+                status = (propstat.findtext("{DAV:}status") or "").split()
+                if len(status) < 2 or status[1] != "200":
+                    continue
+                prop = propstat.find("{DAV:}prop")
+                if (
+                    prop is not None
+                    and prop.find("{DAV:}resourcetype/{DAV:}collection") is not None
+                ):
+                    is_collection = True
+                    break
+            if is_collection:
+                continue
+            name = resource.name
+            if filename_pattern.fullmatch(name):
+                matches[name] = str(resource)
+
+        # Filenames embed UTC YYYYMMDD_HHMMSS, so descending order puts newest first.
+        ordered = sorted(matches.items(), key=lambda item: item[0], reverse=True)
+        stale = ordered[keep_count:]
+        deleted = 0
+        for name, target_url in stale:
+            async with _request(session, "DELETE", target_url, (200, 204, 404)):
+                pass
+            deleted += 1
+            logger.info("Pruned old remote backup %s", name)
+        return deleted
