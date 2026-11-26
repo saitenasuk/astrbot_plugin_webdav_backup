@@ -231,7 +231,13 @@ async def _verify(session, final, size):
 
 
 async def upload(
-    path: Path, collection: str, username: str, password: str, *, probe: bool = False
+    path: Path,
+    collection: str,
+    username: str,
+    password: str,
+    *,
+    probe: bool = False,
+    on_progress=None,
 ) -> None:
     """Upload and verify a uniquely named archive, removing it after a probe.
 
@@ -241,6 +247,7 @@ async def upload(
         username: WebDAV user.
         password: WebDAV application password.
         probe: Delete the uniquely named test file after checking its properties.
+        on_progress: Optional callback invoked with upload and verification progress.
 
     Raises:
         WebDAVError: If the transfer, verification or probe cleanup fails.
@@ -258,16 +265,78 @@ async def upload(
     )
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         with path.open("rb") as file:
+            put_headers = {
+                "Content-Type": "application/zip",
+                "If-None-Match": "*",
+            }
+            if on_progress is not None:
+                put_headers["Content-Length"] = str(size)
+                started = monotonic()
+                last_emit = 0.0
+                on_progress(
+                    {
+                        "stage": "upload",
+                        "detail": "正在上传备份包到 WebDAV…",
+                        "percent": 0.0,
+                        "determinate": True,
+                        "current": 0,
+                        "total": size,
+                        "rate_bps": 0,
+                    }
+                )
+
+                async def _stream_chunks():
+                    nonlocal last_emit
+                    sent = 0
+                    while True:
+                        chunk = file.read(64 * 1024)
+                        if not chunk:
+                            break
+                        sent += len(chunk)
+                        now = monotonic()
+                        if sent >= size or now - last_emit >= 0.25:
+                            last_emit = now
+                            elapsed = max(now - started, 0.001)
+                            on_progress(
+                                {
+                                    "stage": "upload",
+                                    "detail": "正在上传备份包到 WebDAV…",
+                                    "percent": round((sent / size) * 100.0, 1)
+                                    if size
+                                    else 100.0,
+                                    "determinate": True,
+                                    "current": sent,
+                                    "total": size,
+                                    "rate_bps": int(sent / elapsed),
+                                }
+                            )
+                        yield chunk
+
+                body = _stream_chunks()
+            else:
+                body = file
+
             async with _request(
                 session,
                 "PUT",
                 final,
                 (200, 201, 204),
-                data=file,
-                headers={"Content-Type": "application/zip", "If-None-Match": "*"},
+                data=body,
+                headers=put_headers,
             ):
                 pass
         try:
+            if on_progress is not None:
+                on_progress(
+                    {
+                        "stage": "verify",
+                        "detail": "上传完成，正在 PROPFIND 校验远端文件大小…",
+                        "percent": 100.0,
+                        "determinate": False,
+                        "current": size,
+                        "total": size,
+                    }
+                )
             await _verify(session, final, size)
         except (Exception, asyncio.CancelledError):
             if probe:

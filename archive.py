@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from time import monotonic
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import select, text
@@ -21,7 +22,7 @@ DIRECTORIES = (
 )
 
 
-def _write_directories(zf, data, include_temp, plugin_folder):
+def _write_directories(zf, data, include_temp, plugin_folder, on_progress=None):
     """Write only selected native directory entries and collect manifest statistics.
 
     Args:
@@ -29,20 +30,41 @@ def _write_directories(zf, data, include_temp, plugin_folder):
         data: AstrBot data root.
         include_temp: Whether to include the temporary directory.
         plugin_folder: Installed directory name used by AstrBot for plugin config.
+        on_progress: Optional thread-safe callback receiving progress dicts.
 
     Returns:
         Native directory statistics keyed by directory name.
     """
     stats = {}
-    for name in DIRECTORIES:
+    active_dirs = [
+        name
+        for name in DIRECTORIES
+        if not (name == "temp" and not include_temp)
+        and not (data / name).is_symlink()
+        and (data / name).is_dir()
+    ]
+    total_dirs = len(active_dirs) or 1
+    total_files = 0
+    total_bytes = 0
+    last_emit = 0.0
+
+    for idx, name in enumerate(active_dirs):
         root = data / name
-        if (
-            (name == "temp" and not include_temp)
-            or root.is_symlink()
-            or not root.is_dir()
-        ):
-            continue
         count = size = 0
+        base_pct = 45 + (idx / total_dirs) * 50
+
+        if on_progress:
+            last_emit = monotonic()
+            on_progress(
+                {
+                    "stage": "directories",
+                    "detail": f"正在打包目录 {name}（{idx + 1}/{len(active_dirs)}）…",
+                    "percent": round(base_pct, 1),
+                    "determinate": True,
+                    "files": total_files,
+                    "bytes": total_bytes,
+                }
+            )
 
         def raise_walk_error(err):
             raise err
@@ -76,14 +98,37 @@ def _write_directories(zf, data, include_temp, plugin_folder):
                     zf.writestr(member, content)
                 else:
                     zf.write(path, member)
+                file_size = zf.getinfo(member).file_size
                 count += 1
-                size += zf.getinfo(member).file_size
+                size += file_size
+                total_files += 1
+                total_bytes += file_size
+                if on_progress:
+                    now = monotonic()
+                    if now - last_emit >= 0.25:
+                        last_emit = now
+                        on_progress(
+                            {
+                                "stage": "directories",
+                                "detail": f"正在打包目录 {name}（已写入 {total_files} 个文件）…",
+                                "percent": round(base_pct, 1),
+                                "determinate": True,
+                                "files": total_files,
+                                "bytes": total_bytes,
+                            }
+                        )
         stats[name] = {"files": count, "size": size}
     return stats
 
 
 async def create_archive(
-    data, target, main_db, kb_manager, include_temp: bool, plugin_folder=NAME
+    data,
+    target,
+    main_db,
+    kb_manager,
+    include_temp: bool,
+    plugin_folder=NAME,
+    on_progress=None,
 ):
     """Produce a native ZIP with the standard backup components and optionally temp.
 
@@ -94,9 +139,15 @@ async def create_archive(
         kb_manager: Host knowledge base manager.
         include_temp: Whether to include the temporary directory.
         plugin_folder: Actual installed folder name.
+        on_progress: Optional callback invoked with progress payload dicts.
     """
     if kb_manager is None:
         raise RuntimeError("知识库管理器尚未就绪")
+
+    def emit(payload: dict):
+        if on_progress:
+            on_progress(payload)
+
     exporter = AstrBotExporter(main_db, kb_manager)
     with ZipFile(target, "x", compression=ZIP_DEFLATED) as zf:
 
@@ -117,17 +168,53 @@ async def create_archive(
                     ]
             return result
 
+        emit(
+            {
+                "stage": "database",
+                "detail": "正在导出主数据库…",
+                "percent": 5.0,
+                "determinate": True,
+            }
+        )
         main = await read_tables(main_db, MAIN_DB_MODELS)
         await asyncio.to_thread(write_json, "databases/main_db.json", main)
+
+        emit(
+            {
+                "stage": "kb",
+                "detail": "正在导出知识库元数据…",
+                "percent": 15.0,
+                "determinate": True,
+            }
+        )
         metadata = await read_tables(kb_manager.kb_db, KB_METADATA_MODELS)
         await asyncio.to_thread(write_json, "databases/kb_metadata.json", metadata)
-        for kb_id, helper in list(kb_manager.kb_insts.items()):
+
+        kb_items = list(kb_manager.kb_insts.items())
+        for idx, (kb_id, helper) in enumerate(kb_items, start=1):
+            emit(
+                {
+                    "stage": "kb",
+                    "detail": f"正在导出知识库（{idx}/{len(kb_items)}）…",
+                    "percent": round(15.0 + (idx / max(len(kb_items), 1)) * 15.0, 1),
+                    "determinate": True,
+                }
+            )
             documents = await exporter._export_kb_documents(helper)
             await asyncio.to_thread(
                 write_json, f"databases/kb_{kb_id}/documents.json", documents
             )
             await exporter._export_faiss_index(zf, helper, kb_id)
             await exporter._export_kb_media_files(zf, helper, kb_id)
+
+        emit(
+            {
+                "stage": "config",
+                "detail": "正在导出配置文件…",
+                "percent": 32.0,
+                "determinate": True,
+            }
+        )
         for filename in ("cmd_config.json", "mcp_server.json"):
             path = data / filename
             if path.is_file() and not path.is_symlink():
@@ -135,9 +222,41 @@ async def create_archive(
                 member = f"config/{filename}"
                 zf.writestr(member, content)
                 exporter._add_checksum(member, content)
-        await exporter._export_attachments(zf, main.get("attachments", []))
+
+        attachments = main.get("attachments", [])
+        emit(
+            {
+                "stage": "attachments",
+                "detail": (
+                    f"正在导出附件文件（{len(attachments)} 条记录）…"
+                    if attachments
+                    else "正在检查附件文件…"
+                ),
+                "percent": 40.0,
+                "determinate": True,
+            }
+        )
+        await exporter._export_attachments(zf, attachments)
+
+        loop = asyncio.get_running_loop()
+        dir_progress = (
+            (lambda payload: loop.call_soon_threadsafe(on_progress, payload))
+            if on_progress
+            else None
+        )
         stats = await asyncio.to_thread(
-            _write_directories, zf, data, include_temp, plugin_folder
+            _write_directories, zf, data, include_temp, plugin_folder, dir_progress
+        )
+        if on_progress:
+            await asyncio.sleep(0)
+
+        emit(
+            {
+                "stage": "manifest",
+                "detail": "正在生成清单并完成打包…",
+                "percent": 98.0,
+                "determinate": True,
+            }
         )
         manifest = exporter._generate_manifest(main, metadata, stats)
         manifest["has_config"] = "config/cmd_config.json" in zf.namelist()

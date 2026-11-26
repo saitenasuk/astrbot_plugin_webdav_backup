@@ -19,6 +19,10 @@ let lastSyncAt = null;
 let toastTimer = null;
 let cronPreviewTimer = null;
 let pollTimer = null;
+let sseSubId = null;
+let sseConnected = false;
+let sseRetryTimer = null;
+let sseRetryAttempt = 0;
 
 function applyHostTheme(ctx) {
   const root = document.documentElement;
@@ -164,7 +168,10 @@ function renderTopHealth() {
   }
 
   if (lastSyncAt) {
-    el("last-sync").textContent = `更新于 ${lastSyncAt.toLocaleTimeString("zh-CN", { hour12: false })}`;
+    const syncTime = lastSyncAt.toLocaleTimeString("zh-CN", { hour12: false });
+    el("last-sync").textContent = sseConnected
+      ? `实时连接 · ${syncTime}`
+      : `更新于 ${syncTime}`;
   }
 }
 
@@ -271,6 +278,82 @@ function renderKpis() {
   el("kpi-grid").replaceChildren(kpiLast, kpiNext, kpiRate, kpiStore);
 }
 
+function formatProgressDetail(progress) {
+  if (!progress) return "";
+  if (progress.stage === "upload" && Number.isFinite(progress.total)) {
+    const parts = [
+      `${formatBytes(progress.current || 0)} / ${formatBytes(progress.total)}`,
+    ];
+    if (Number.isFinite(progress.rate_bps) && progress.rate_bps > 0) {
+      parts.push(`${formatBytes(progress.rate_bps)}/s`);
+    }
+    return parts.join(" · ");
+  }
+  if (
+    progress.stage === "directories" &&
+    Number.isFinite(progress.bytes) &&
+    progress.bytes > 0
+  ) {
+    return `${progress.detail || "正在打包目录…"} · 已写入 ${formatBytes(progress.bytes)}`;
+  }
+  return progress.detail || "";
+}
+
+function fillProgressBox(box, phase, startedIso, progress) {
+  const pct =
+    progress?.determinate && Number.isFinite(progress.percent)
+      ? Math.min(100, Math.max(0, Number(progress.percent)))
+      : null;
+  const label = pct !== null ? `${phase} · ${pct.toFixed(pct === 100 || pct === 0 ? 0 : 1)}%` : `阶段：${phase}`;
+  const headLabel = box.querySelector(".progress-label");
+  if (headLabel) headLabel.textContent = label;
+
+  const elapsedEl = box.querySelector(".elapsed-timer");
+  if (elapsedEl) {
+    elapsedEl.dataset.started = startedIso || "";
+    elapsedEl.textContent = startedIso
+      ? `已运行 ${Math.max(0, Math.floor((Date.now() - new Date(startedIso).getTime()) / 1000))}s`
+      : "";
+  }
+
+  const track = box.querySelector(".progress-track");
+  if (track) {
+    if (pct !== null) {
+      let fill = track.querySelector(".progress-fill");
+      if (!fill) {
+        fill = node("div", undefined, "progress-fill");
+        track.replaceChildren(fill);
+      }
+      fill.style.width = `${pct}%`;
+    } else if (!track.querySelector(".progress-bar")) {
+      track.replaceChildren(node("div", undefined, "progress-bar"));
+    }
+  }
+
+  const detailEl = box.querySelector(".progress-detail");
+  if (detailEl) {
+    const detailText = formatProgressDetail(progress);
+    detailEl.textContent = detailText;
+    detailEl.hidden = !detailText;
+  }
+}
+
+function updateCardProgressInPlace(targetMode) {
+  if (!model) return false;
+  const box = document.querySelector(`[data-progress-mode="${targetMode}"]`);
+  const phase = model.phases?.[targetMode] || "空闲";
+  if (!box || phase === "空闲") return false;
+  const pill = document.querySelector(`[data-card-pill="${targetMode}"]`);
+  if (pill) pill.textContent = phase;
+  fillProgressBox(
+    box,
+    phase,
+    model.phase_started?.[targetMode],
+    model.progress?.[targetMode],
+  );
+  return true;
+}
+
 function renderCards() {
   const cards = [];
   for (const key of ["local", "webdav"]) {
@@ -307,7 +390,9 @@ function renderCards() {
             ? "上次成功"
             : "上次失败"
           : "空闲";
-    head.append(titleWrap, node("span", pillText, pillClass));
+    const pillEl = node("span", pillText, pillClass);
+    pillEl.dataset.cardPill = key;
+    head.append(titleWrap, pillEl);
     card.append(head);
 
     // Metric Row
@@ -335,17 +420,21 @@ function renderCards() {
     // Live progress indicator when active
     if (isRunning) {
       const box = node("div", undefined, "progress-box");
+      box.dataset.progressMode = key;
       const pHead = node("div", undefined, "progress-head");
-      const startedIso = model.phase_started?.[key];
-      const elapsedEl = node("span", "", "elapsed-timer");
-      elapsedEl.dataset.started = startedIso || "";
-      elapsedEl.textContent = startedIso
-        ? `已运行 ${Math.max(0, Math.floor((Date.now() - new Date(startedIso).getTime()) / 1000))}s`
-        : "";
-      pHead.append(node("span", `阶段：${phase}`), elapsedEl);
+      pHead.append(
+        node("span", "", "progress-label"),
+        node("span", "", "elapsed-timer"),
+      );
       const track = node("div", undefined, "progress-track");
-      track.append(node("div", undefined, "progress-bar"));
-      box.append(pHead, track);
+      const detail = node("div", "", "progress-detail");
+      box.append(pHead, track, detail);
+      fillProgressBox(
+        box,
+        phase,
+        model.phase_started?.[key],
+        model.progress?.[key],
+      );
       card.append(box);
     }
 
@@ -967,7 +1056,8 @@ function renderAll() {
 
 function scheduleNextPoll() {
   clearTimeout(pollTimer);
-  const delay = hasAnyActivePhase() ? 2500 : 10000;
+  // When SSE is connected, only run a low-frequency 60s safety refresh.
+  const delay = sseConnected ? 60000 : hasAnyActivePhase() ? 2500 : 10000;
   pollTimer = setTimeout(async () => {
     if (!document.hidden && !busy) {
       await refresh().catch((err) => showToast(err.message, "error"));
@@ -976,16 +1066,119 @@ function scheduleNextPoll() {
   }, delay);
 }
 
+function handleSSEEvent(event) {
+  if (!model || !event || typeof event.parsed !== "object" || !event.parsed) {
+    return;
+  }
+  const data = event.parsed;
+  if (event.eventType === "snapshot") {
+    model.phases = { ...model.phases, ...(data.phases || {}) };
+    model.phase_started = {
+      ...(model.phase_started || {}),
+      ...(data.phase_started || {}),
+    };
+    model.progress = { ...(model.progress || {}), ...(data.progress || {}) };
+    renderTopHealth();
+    renderCards();
+    return;
+  }
+  if (event.eventType === "progress" && data.mode) {
+    const prevPhase = model.phases?.[data.mode] || "空闲";
+    model.phases[data.mode] = data.phase || "空闲";
+    model.phase_started = model.phase_started || {};
+    model.phase_started[data.mode] = data.phase_started ?? null;
+    model.progress = model.progress || {};
+    model.progress[data.mode] = data.progress ?? null;
+    renderTopHealth();
+    if (prevPhase !== "空闲" && model.phases[data.mode] !== "空闲") {
+      if (!updateCardProgressInPlace(data.mode)) {
+        renderCards();
+      }
+    } else {
+      renderCards();
+    }
+    return;
+  }
+  if (event.eventType === "completed" && data.record) {
+    const rec = data.record;
+    const label = NAMES[rec.mode] || rec.mode;
+    archivesCache.local = null;
+    archivesCache.webdav = null;
+    if (rec.ok) {
+      showToast(`${label}备份已完成（${formatBytes(rec.size)}）`, "success");
+    } else {
+      showToast(`${label}备份失败：${rec.error || "请查看运行历史"}`, "error");
+    }
+    refresh().catch(() => {});
+  }
+}
+
+function scheduleSSEReconnect() {
+  clearTimeout(sseRetryTimer);
+  const delays = [3000, 6000, 15000, 30000];
+  const wait = delays[Math.min(sseRetryAttempt, delays.length - 1)];
+  sseRetryAttempt += 1;
+  sseRetryTimer = setTimeout(() => {
+    if (!document.hidden) {
+      connectSSE();
+    } else {
+      scheduleSSEReconnect();
+    }
+  }, wait);
+}
+
+async function connectSSE() {
+  if (!bridge?.subscribeSSE) return;
+  if (sseSubId) {
+    const oldId = sseSubId;
+    sseSubId = null;
+    bridge.unsubscribeSSE(oldId).catch(() => {});
+  }
+  try {
+    sseSubId = await bridge.subscribeSSE("events", {
+      onOpen() {
+        sseConnected = true;
+        sseRetryAttempt = 0;
+        if (model) renderTopHealth();
+        scheduleNextPoll();
+      },
+      onMessage(event) {
+        handleSSEEvent(event);
+      },
+      onClose() {
+        sseConnected = false;
+        sseSubId = null;
+        if (model) renderTopHealth();
+        scheduleNextPoll();
+        scheduleSSEReconnect();
+      },
+      onError() {
+        sseConnected = false;
+        sseSubId = null;
+        if (model) renderTopHealth();
+        scheduleNextPoll();
+        scheduleSSEReconnect();
+      },
+    });
+  } catch {
+    sseConnected = false;
+    sseSubId = null;
+    scheduleNextPoll();
+    scheduleSSEReconnect();
+  }
+}
+
 async function refresh() {
   if (loading) return;
   loading = true;
+  const hadModel = Boolean(model);
   const prevHistoryTop = model?.history?.[0]?.time;
   try {
     model = await bridge.apiGet("dashboard");
     lastSyncAt = new Date();
     renderAll();
     // Invalidate cached archive lists when a new backup completes
-    if (prevHistoryTop && model.history?.[0]?.time !== prevHistoryTop) {
+    if (hadModel && model.history?.[0]?.time !== prevHistoryTop) {
       archivesCache.local = null;
       archivesCache.webdav = null;
       if (activeTab === "archives") {
@@ -1229,13 +1422,19 @@ try {
   const offContext = bridge.onContext(applyHostTheme);
   await refresh();
   scheduleNextPoll();
+  connectSSE();
   window.addEventListener(
     "pagehide",
     () => {
       offContext();
       systemDarkQuery.removeEventListener("change", onSystemThemeChange);
       clearTimeout(pollTimer);
+      clearTimeout(sseRetryTimer);
       clearInterval(tickTimer);
+      if (sseSubId) {
+        bridge.unsubscribeSSE(sseSubId).catch(() => {});
+        sseSubId = null;
+      }
     },
     { once: true },
   );

@@ -15,7 +15,13 @@ from yarl import URL
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.api.web import error_response, file_response, json_response, request
+from astrbot.api.web import (
+    error_response,
+    file_response,
+    json_response,
+    request,
+    stream_response,
+)
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .archive import NAME, create_archive
@@ -53,6 +59,8 @@ class BackupDashboard(Star):
         self.tasks = {}
         self.phases = dict.fromkeys(MODES, "空闲")
         self.phase_started: dict[str, str | None] = dict.fromkeys(MODES, None)
+        self.progress: dict[str, dict | None] = dict.fromkeys(MODES, None)
+        self._subscribers: set[asyncio.Queue[str | None]] = set()
         self.lock = asyncio.Lock()
         self.closing = False
         self.history = []
@@ -60,6 +68,7 @@ class BackupDashboard(Star):
         self.history_file = StarTools.get_data_dir(NAME) / "runs.json"
         for endpoint, method, handler in [
             ("dashboard", "GET", self.dashboard),
+            ("events", "GET", self.events),
             ("settings", "POST", self.settings),
             ("cron-preview", "POST", self.cron_preview),
             ("test-connection", "POST", self.test_connection),
@@ -155,6 +164,7 @@ class BackupDashboard(Star):
                 "password_set": bool(self.config.get("password")),
                 "phases": self.phases,
                 "phase_started": self.phase_started,
+                "progress": self.progress,
                 "next": jobs,
                 "plan_errors": self.plan_errors,
                 "history": self.history,
@@ -165,6 +175,86 @@ class BackupDashboard(Star):
                     "plugin_size": plugin_size,
                 },
             }
+        )
+
+    def _broadcast(self, event_type: str, payload: dict) -> None:
+        """Broadcast an SSE event to all active dashboard subscribers.
+
+        Args:
+            event_type: SSE event name.
+            payload: JSON-serializable event payload.
+        """
+        if not self._subscribers:
+            return
+        frame = f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        for queue in list(self._subscribers):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                pass
+
+    def _update_progress(
+        self, mode: str, phase: str, progress: dict | None = None
+    ) -> None:
+        """Update in-memory task progress and broadcast it to SSE subscribers.
+
+        Args:
+            mode: Destination mode (``local`` or ``webdav``).
+            phase: Short human-readable stage title.
+            progress: Optional structured progress metadata dict.
+        """
+        self.phases[mode] = phase
+        self.progress[mode] = progress
+        self._broadcast(
+            "progress",
+            {
+                "mode": mode,
+                "phase": phase,
+                "phase_started": self.phase_started[mode],
+                "progress": progress,
+            },
+        )
+
+    async def events(self):
+        """Stream live backup progress and completion events over SSE.
+
+        Returns:
+            A text/event-stream response emitting snapshot, progress, and completion events.
+        """
+        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=64)
+        self._subscribers.add(queue)
+
+        async def stream():
+            try:
+                snapshot = {
+                    "phases": dict(self.phases),
+                    "phase_started": dict(self.phase_started),
+                    "progress": dict(self.progress),
+                }
+                yield f"event: snapshot\ndata: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                while not self.closing:
+                    try:
+                        frame = await asyncio.wait_for(queue.get(), timeout=25.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    if frame is None:
+                        break
+                    yield frame
+            finally:
+                self._subscribers.discard(queue)
+
+        return stream_response(
+            stream(),
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     async def settings(self):
@@ -313,8 +403,16 @@ class BackupDashboard(Star):
     def _enqueue(self, mode, trigger: str = "manual"):
         if self.closing or (mode in self.tasks and not self.tasks[mode].done()):
             return False
-        self.phases[mode] = "排队中"
         self.phase_started[mode] = datetime.now(timezone.utc).isoformat()
+        self._update_progress(
+            mode,
+            "排队中",
+            {
+                "stage": "queue",
+                "detail": "任务已进入队列，等待执行…",
+                "determinate": False,
+            },
+        )
         self.tasks[mode] = asyncio.create_task(self._backup(mode, trigger=trigger))
         return True
 
@@ -616,7 +714,16 @@ class BackupDashboard(Star):
                     prefix=".backup-", dir=backups
                 ) as work:
                     path = Path(work) / name
-                    self.phases[mode] = "正在打包"
+                    self._update_progress(
+                        mode,
+                        "正在打包",
+                        {
+                            "stage": "database",
+                            "detail": "准备打包备份内容…",
+                            "percent": 0.0,
+                            "determinate": True,
+                        },
+                    )
                     await create_archive(
                         data,
                         path,
@@ -624,25 +731,59 @@ class BackupDashboard(Star):
                         self.context.kb_manager,
                         include_temp=include_temp,
                         plugin_folder=Path(__file__).parent.name,
+                        on_progress=lambda info: self._update_progress(
+                            mode, "正在打包", info
+                        ),
                     )
                     size = path.stat().st_size
                     logger.info("Created %s archive %s (%d bytes)", mode, name, size)
                     if mode == "local":
                         path.replace(backups / name)
                     else:
-                        self.phases[mode] = "正在上传并校验"
+                        self._update_progress(
+                            mode,
+                            "正在上传并校验",
+                            {
+                                "stage": "upload",
+                                "detail": "准备上传备份包到 WebDAV…",
+                                "percent": 0.0,
+                                "determinate": True,
+                                "current": 0,
+                                "total": size,
+                                "rate_bps": 0,
+                            },
+                        )
                         await upload(
                             path,
                             collection,
                             settings.get("username", ""),
                             settings.get("password", ""),
+                            on_progress=lambda info: self._update_progress(
+                                mode,
+                                "正在校验远端"
+                                if info.get("stage") == "verify"
+                                else "正在上传",
+                                info,
+                            ),
                         )
                 record.update(ok=True, name=name, size=size)
                 logger.info("%s backup completed: %s (%d bytes)", mode, name, size)
 
                 keep_count = settings.get(f"{mode}_keep_count", 0)
-                if isinstance(keep_count, int) and not isinstance(keep_count, bool) and keep_count > 0:
-                    self.phases[mode] = "正在清理旧备份"
+                if (
+                    isinstance(keep_count, int)
+                    and not isinstance(keep_count, bool)
+                    and keep_count > 0
+                ):
+                    self._update_progress(
+                        mode,
+                        "正在清理旧备份",
+                        {
+                            "stage": "prune",
+                            "detail": f"正在按保留策略（最多 {keep_count} 份）清理旧备份…",
+                            "determinate": False,
+                        },
+                    )
                     try:
                         if mode == "local":
                             owned = sorted(
@@ -702,6 +843,7 @@ class BackupDashboard(Star):
                 record["duration_ms"] = int((monotonic() - started) * 1000)
                 self.phases[mode] = "空闲"
                 self.phase_started[mode] = None
+                self.progress[mode] = None
                 self.history = [record, *self.history][:30]
                 try:
                     temp = self.history_file.with_suffix(".tmp")
@@ -711,9 +853,15 @@ class BackupDashboard(Star):
                     temp.replace(self.history_file)
                 except OSError:
                     logger.warning("Could not persist backup history")
+                self._broadcast("completed", {"mode": mode, "record": record})
 
     async def terminate(self):
         self.closing = True
+        for queue in list(self._subscribers):
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
         if self.scheduler:
             self.scheduler.shutdown(wait=False)
         if self.tasks:

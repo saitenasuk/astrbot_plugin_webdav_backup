@@ -622,3 +622,76 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             ):
                 self.assertEqual((await self.bot.delete_webdav_archive()).status_code, 200)
             self.assertNotIn('corrupt.zip', remote_files)
+
+    async def test_archive_and_webdav_progress_callbacks(self):
+        archive_events = []
+        target = self.data / 'progress_test.zip'
+        await plugin.create_archive(
+            self.data,
+            target,
+            self.db,
+            self.kb_manager,
+            include_temp=False,
+            plugin_folder=plugin.NAME,
+            on_progress=archive_events.append,
+        )
+        stages = [e['stage'] for e in archive_events]
+        for expected in ('database', 'kb', 'config', 'attachments', 'directories', 'manifest'):
+            self.assertIn(expected, stages)
+
+        upload_events = []
+        seen_content_length = None
+
+        async def handle(request):
+            nonlocal seen_content_length
+            if request.method == 'PUT':
+                seen_content_length = request.headers.get('Content-Length')
+                body = await request.read()
+                self.assertEqual(len(body), target.stat().st_size)
+                return web.Response(status=201)
+            if request.method == 'PROPFIND':
+                return properties(request.raw_path, target.stat().st_size)
+            return web.Response(status=405)
+
+        app = web.Application()
+        app.router.add_route('*', '/dav/{name}', handle)
+        async with TestServer(app) as server:
+            await plugin.upload(
+                target,
+                str(server.make_url('/dav/')),
+                'u',
+                'p',
+                on_progress=upload_events.append,
+            )
+        self.assertEqual(seen_content_length, str(target.stat().st_size))
+        self.assertTrue(
+            any(
+                e['stage'] == 'upload'
+                and e['current'] == target.stat().st_size
+                and e['percent'] == 100.0
+                for e in upload_events
+            ),
+            upload_events,
+        )
+        self.assertEqual(upload_events[-1]['stage'], 'verify')
+
+    async def test_sse_events_stream_snapshot_progress_and_completion(self):
+        response = await self.bot.events()
+        self.assertEqual(response.media_type, 'text/event-stream')
+        self.assertEqual(response.headers.get('x-accel-buffering'), 'no')
+
+        stream = response.body_iterator
+        first = await anext(stream)
+        self.assertIn('event: snapshot\n', first)
+
+        backup_task = asyncio.create_task(self.bot._backup('local'))
+        received = []
+        while True:
+            chunk = await asyncio.wait_for(anext(stream), timeout=10)
+            received.append(chunk)
+            if chunk.startswith('event: completed\n'):
+                break
+        await backup_task
+        self.assertTrue(any(c.startswith('event: progress\n') for c in received))
+        await stream.aclose()
+        self.assertEqual(len(self.bot._subscribers), 0)
