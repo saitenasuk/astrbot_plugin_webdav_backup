@@ -27,7 +27,11 @@
 
 目录遍历跳过符号链接、`.git`、`__pycache__` 和 `.pyc`。运行期间数据库与文件可以继续变化，知识库批量导入等写入任务结束后生成的备份更适合迁移。
 
-[本地与 WebDAV 设置截图](docs/zh/local-backup.md) · [Backup settings guide](docs/en/local-backup.md)
+## 界面预览
+
+![备份仪表盘总览与运行历史](assets/dashboard.png)
+
+![备份文件管理与 WebDAV 远端拉取](assets/back-file-list.png)
 
 ## 本地、WebDAV 与恢复
 
