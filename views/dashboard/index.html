@@ -59,6 +59,17 @@
           <button
             type="button"
             role="tab"
+            id="tab-btn-logs"
+            data-tab="logs"
+            aria-selected="false"
+            aria-controls="tab-logs"
+            class="tab-btn"
+          >
+            运行日志 <span id="logs-count" class="tab-count">0</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
             id="tab-btn-settings"
             data-tab="settings"
             aria-selected="false"
@@ -174,6 +185,65 @@
           <p id="archives-tip" class="tip-banner"></p>
           <div id="archives-list" class="archive-list">
             <p class="empty">点击上方位置加载备份文件列表。</p>
+          </div>
+        </div>
+
+        <div
+          id="tab-logs"
+          role="tabpanel"
+          aria-labelledby="tab-btn-logs"
+          class="tab-panel"
+          hidden
+        >
+          <div class="toolbar">
+            <div class="filter-group" role="group" aria-label="按日志级别筛选">
+              <button
+                type="button"
+                class="chip"
+                data-log-level="ALL"
+                aria-pressed="true"
+              >
+                全部
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-log-level="INFO"
+                aria-pressed="false"
+              >
+                INFO
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-log-level="WARNING"
+                aria-pressed="false"
+              >
+                WARNING
+              </button>
+              <button
+                type="button"
+                class="chip"
+                data-log-level="ERROR"
+                aria-pressed="false"
+              >
+                ERROR
+              </button>
+            </div>
+            <div class="archives-tools">
+              <button id="refresh-logs-btn" type="button" class="btn btn-sm">
+                刷新
+              </button>
+              <button id="copy-logs-btn" type="button" class="btn btn-sm">
+                复制日志
+              </button>
+              <button id="clear-logs-btn" type="button" class="btn btn-danger btn-sm">
+                清空
+              </button>
+            </div>
+          </div>
+          <div id="logs-list" class="log-list">
+            <p class="empty">暂无插件运行日志。</p>
           </div>
         </div>
 

@@ -668,9 +668,13 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
             any(
                 e['stage'] == 'upload'
                 and e['current'] == target.stat().st_size
-                and e['percent'] == 100.0
+                and e['percent'] == 99.0
                 for e in upload_events
             ),
+            upload_events,
+        )
+        self.assertTrue(
+            any(e['stage'] == 'commit' for e in upload_events),
             upload_events,
         )
         self.assertEqual(upload_events[-1]['stage'], 'verify')
@@ -790,3 +794,56 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         out = [m async for m in self.bot.cmd_backup_notify(ev, 'del')]
         self.assertIn('移出', out[0])
         self.assertNotIn('telegram:FriendMessage:999', self.config['notify_targets'])
+
+    async def test_webdav_pull_follows_302_and_strips_cross_origin_auth(self):
+        zip_path = self.data / 'cdn_sample.zip'
+        with ZipFile(zip_path, 'w') as zf:
+            zf.writestr('manifest.json', '{"cdn": true}')
+        zip_bytes = zip_path.read_bytes()
+        cdn_auth_headers = []
+
+        async def handle_cdn(request):
+            cdn_auth_headers.append(request.headers.get('Authorization'))
+            return web.Response(body=zip_bytes)
+
+        cdn_app = web.Application()
+        cdn_app.router.add_get('/signed/archive.zip', handle_cdn)
+
+        async with TestServer(cdn_app) as cdn_server:
+            cdn_url = str(cdn_server.make_url('/signed/archive.zip'))
+
+            async def handle_dav(request):
+                if request.method == 'GET':
+                    self.assertIsNotNone(request.headers.get('Authorization'))
+                    return web.Response(status=302, headers={'Location': cdn_url})
+                return web.Response(status=405)
+
+            dav_app = web.Application()
+            dav_app.router.add_route('*', '/dav/{name}', handle_dav)
+            async with TestServer(dav_app) as dav_server:
+                self.config.update(
+                    url=str(dav_server.make_url('/dav/')),
+                    remote_dir='/',
+                    username='backup',
+                    password='secret',
+                    allow_http=True,
+                )
+                target_name = 'astrbot_backup_20261126_134714_webdav_635ac6ef6444.zip'
+                with patch.object(
+                    plugin,
+                    'request',
+                    SimpleNamespace(json=AsyncMock(return_value={'name': target_name})),
+                ):
+                    res = await self.bot.pull_webdav_archive()
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(cdn_auth_headers, [None])
+                self.assertTrue((self.data / 'backups' / target_name).is_file())
+
+    async def test_logs_api_and_clear(self):
+        await self.bot._backup('local')
+        res = json.loads((await self.bot.get_logs()).body)
+        self.assertGreaterEqual(len(res['items']), 2)
+        self.assertEqual(res['items'][0]['category'], 'backup')
+        self.assertEqual((await self.bot.clear_logs()).status_code, 200)
+        after = json.loads((await self.bot.get_logs()).body)
+        self.assertEqual(after['items'], [])

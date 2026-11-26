@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import json
 import os
 import re
@@ -67,6 +68,8 @@ class BackupDashboard(Star):
         self.phase_started: dict[str, str | None] = dict.fromkeys(MODES, None)
         self.progress: dict[str, dict | None] = dict.fromkeys(MODES, None)
         self._subscribers: set[asyncio.Queue[str | None]] = set()
+        self.logs: deque[dict] = deque(maxlen=200)
+        self._log_seq = 0
         self.lock = asyncio.Lock()
         self.closing = False
         self.history = []
@@ -75,6 +78,8 @@ class BackupDashboard(Star):
         for endpoint, method, handler in [
             ("dashboard", "GET", self.dashboard),
             ("events", "GET", self.events),
+            ("logs", "GET", self.get_logs),
+            ("logs/clear", "POST", self.clear_logs),
             ("temp-size", "GET", self.temp_size),
             ("settings", "POST", self.settings),
             ("cron-preview", "POST", self.cron_preview),
@@ -125,7 +130,12 @@ class BackupDashboard(Star):
                 )
             except (ValueError, ZoneInfoNotFoundError) as exc:
                 self.plan_errors[mode] = "计划无效，请检查 Cron 和时区。"
-                logger.warning("Invalid schedule for %s: %s", mode, type(exc).__name__)
+                self._record_log(
+                    "WARNING",
+                    "system",
+                    f"{'本地' if mode == 'local' else 'WebDAV'}定时计划配置无效（{type(exc).__name__}）",
+                    f"Invalid schedule for {mode}: {type(exc).__name__}",
+                )
 
     async def dashboard(self):
         """Return full dashboard telemetry, configuration summary, and run history.
@@ -193,6 +203,7 @@ class BackupDashboard(Star):
                 "next": jobs,
                 "plan_errors": self.plan_errors,
                 "history": self.history,
+                "log_count": len(self.logs),
                 "local_storage": {
                     "total_count": total_count,
                     "total_size": total_size,
@@ -201,6 +212,52 @@ class BackupDashboard(Star):
                 },
             }
         )
+
+    def _record_log(
+        self, level: str, category: str, message: str, console_message: str | None = None
+    ) -> None:
+        """Record a concise operational log entry for both AstrBot console and dashboard UI.
+
+        Args:
+            level: Log severity (``INFO``, ``WARNING``, or ``ERROR``).
+            category: Logical category (``backup``, ``webdav``, ``archive``, ``notify``, ``system``).
+            message: Human-readable message displayed in the dashboard Logs tab.
+            console_message: Optional English message written to AstrBot's logger.
+        """
+        self._log_seq += 1
+        entry = {
+            "id": self._log_seq,
+            "time": datetime.now(timezone.utc).isoformat(),
+            "level": level,
+            "category": category,
+            "message": message,
+        }
+        self.logs.appendleft(entry)
+        text = console_message or message
+        if level == "ERROR":
+            logger.error("%s", text)
+        elif level == "WARNING":
+            logger.warning("%s", text)
+        else:
+            logger.info("%s", text)
+        self._broadcast("log", entry)
+
+    async def get_logs(self):
+        """Return recent in-memory plugin operational logs newest-first.
+
+        Returns:
+            A JSON response containing the log entries list.
+        """
+        return json_response({"items": list(self.logs)})
+
+    async def clear_logs(self):
+        """Clear the in-memory plugin log ring buffer.
+
+        Returns:
+            A JSON response confirming the buffer was cleared.
+        """
+        self.logs.clear()
+        return json_response({"cleared": True})
 
     def _broadcast(self, event_type: str, payload: dict) -> None:
         """Broadcast an SSE event to all active dashboard subscribers.
@@ -515,14 +572,18 @@ class BackupDashboard(Star):
                     target.strip(), MessageChain().message(text)
                 )
                 if not matched:
-                    logger.warning(
-                        "Backup notification target platform not found: %s", target
+                    self._record_log(
+                        "WARNING",
+                        "notify",
+                        f"通知发送未匹配到运行中的平台：{target}",
+                        f"Backup notification target platform not found: {target}",
                     )
             except Exception as exc:
-                logger.warning(
-                    "Failed to send backup notification to %s: %s",
-                    target,
-                    exc,
+                self._record_log(
+                    "WARNING",
+                    "notify",
+                    f"通知发送失败（{target}）：{exc}",
+                    f"Failed to send backup notification to {target}: {exc}",
                 )
 
     async def test_notification(self):
@@ -691,12 +752,20 @@ class BackupDashboard(Star):
                 with ZipFile(path, "w") as archive:
                     archive.writestr("test.txt", "AstrBot WebDAV connection test")
                 await upload(path, collection, username, password, probe=True)
-            logger.info("WebDAV connection test completed for %s", collection)
+            self._record_log(
+                "INFO",
+                "webdav",
+                "WebDAV 连接测试通过（写入、校验并清理成功）",
+                "WebDAV connection test completed",
+            )
             return json_response({"verified": True})
         except (WebDAVError, OSError) as exc:
             reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
-            logger.warning(
-                "WebDAV connection test failed for %s: %s", collection, reason
+            self._record_log(
+                "WARNING",
+                "webdav",
+                f"WebDAV 连接测试失败：{reason}",
+                f"WebDAV connection test failed: {reason}",
             )
             return error_response(reason, status_code=502)
 
@@ -847,9 +916,19 @@ class BackupDashboard(Star):
         try:
             target.unlink()
         except OSError as exc:
-            logger.warning("Failed to delete local backup %s: %s", name, exc)
+            self._record_log(
+                "WARNING",
+                "archive",
+                f"删除本地备份失败（{name}）：{exc}",
+                f"Failed to delete local backup {name}: {exc}",
+            )
             return error_response("删除本地备份失败", status_code=500)
-        logger.info("Deleted local backup %s", name)
+        self._record_log(
+            "INFO",
+            "archive",
+            f"已删除本地备份 {name}",
+            f"Deleted local backup {name}",
+        )
         return json_response({"deleted": True, "name": name})
 
     async def list_webdav_archives(self):
@@ -874,7 +953,12 @@ class BackupDashboard(Star):
             )
         except (WebDAVError, OSError) as exc:
             reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
-            logger.warning("WebDAV list failed for %s: %s", collection, reason)
+            self._record_log(
+                "WARNING",
+                "webdav",
+                f"读取 WebDAV 远端文件列表失败：{reason}",
+                f"WebDAV list failed: {reason}",
+            )
             return error_response(reason, status_code=502)
         backups_dir = Path(get_astrbot_data_path()) / "backups"
         total_size = 0
@@ -928,6 +1012,7 @@ class BackupDashboard(Star):
                     staged,
                     self.config.get("username", ""),
                     self.config.get("password", ""),
+                    allow_http=bool(self.config.get("allow_http", False)),
                 )
 
                 def _verify_zip(path: Path) -> None:
@@ -938,12 +1023,28 @@ class BackupDashboard(Star):
                 await asyncio.to_thread(_verify_zip, staged)
                 staged.replace(final_path)
         except BadZipFile:
+            self._record_log(
+                "WARNING",
+                "archive",
+                f"拉取远端备份失败（{name}）：文件不是有效的 ZIP 包",
+                f"WebDAV pull rejected invalid ZIP {name}",
+            )
             return error_response("远端文件不是有效的 ZIP 备份包", status_code=502)
         except (WebDAVError, OSError) as exc:
             reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
-            logger.warning("WebDAV pull failed for %s: %s", name, reason)
+            self._record_log(
+                "WARNING",
+                "archive",
+                f"拉取远端备份失败（{name}）：{reason}",
+                f"WebDAV pull failed for {name}: {reason}",
+            )
             return error_response(reason, status_code=502)
-        logger.info("Pulled remote backup %s to local (%d bytes)", name, size)
+        self._record_log(
+            "INFO",
+            "archive",
+            f"已将远端备份拉取到本地：{name}（{self._format_size(size)}）",
+            f"Pulled remote backup {name} to local ({self._format_size(size)})",
+        )
         return json_response({"pulled": True, "name": name, "size": size})
 
     async def delete_webdav_archive(self):
@@ -972,9 +1073,19 @@ class BackupDashboard(Star):
             )
         except (WebDAVError, OSError) as exc:
             reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
-            logger.warning("WebDAV delete failed for %s: %s", name, reason)
+            self._record_log(
+                "WARNING",
+                "archive",
+                f"删除远端备份失败（{name}）：{reason}",
+                f"WebDAV delete failed for {name}: {reason}",
+            )
             return error_response(reason, status_code=502)
-        logger.info("Deleted remote backup %s", name)
+        self._record_log(
+            "INFO",
+            "archive",
+            f"已删除远端备份 {name}",
+            f"Deleted remote backup {name}",
+        )
         return json_response({"deleted": True, "name": name})
 
     async def _backup(self, mode, trigger: str = "manual"):
@@ -1005,13 +1116,13 @@ class BackupDashboard(Star):
                 )
                 if mode == "webdav":
                     record["remote"] = collection + name
-                logger.info(
-                    "Starting %s backup %s (trigger=%s, include_temp=%s, destination=%s)",
-                    mode,
-                    name,
-                    trigger,
-                    include_temp,
-                    record.get("remote", backups),
+                mode_label = "本地" if mode == "local" else "WebDAV"
+                trigger_label = "定时" if trigger == "schedule" else "手动"
+                self._record_log(
+                    "INFO",
+                    "backup",
+                    f"开始{mode_label}{trigger_label}备份（{'含 temp' if include_temp else '不含 temp'}）",
+                    f"Starting {mode} backup ({trigger}, include_temp={include_temp})",
                 )
                 with tempfile.TemporaryDirectory(
                     prefix=".backup-", dir=backups
@@ -1039,13 +1150,13 @@ class BackupDashboard(Star):
                         ),
                     )
                     size = path.stat().st_size
-                    logger.info("Created %s archive %s (%d bytes)", mode, name, size)
+                    logger.debug("Created %s archive %s (%d bytes)", mode, name, size)
                     if mode == "local":
                         path.replace(backups / name)
                     else:
                         self._update_progress(
                             mode,
-                            "正在上传并校验",
+                            "正在上传",
                             {
                                 "stage": "upload",
                                 "detail": "准备上传备份包到 WebDAV…",
@@ -1056,6 +1167,11 @@ class BackupDashboard(Star):
                                 "rate_bps": 0,
                             },
                         )
+                        stage_titles = {
+                            "upload": "正在上传",
+                            "commit": "等待服务端写入",
+                            "verify": "正在校验远端",
+                        }
                         await upload(
                             path,
                             collection,
@@ -1063,14 +1179,11 @@ class BackupDashboard(Star):
                             settings.get("password", ""),
                             on_progress=lambda info: self._update_progress(
                                 mode,
-                                "正在校验远端"
-                                if info.get("stage") == "verify"
-                                else "正在上传",
+                                stage_titles.get(info.get("stage", ""), "正在上传"),
                                 info,
                             ),
                         )
                 record.update(ok=True, name=name, size=size)
-                logger.info("%s backup completed: %s (%d bytes)", mode, name, size)
 
                 keep_count = settings.get(f"{mode}_keep_count", 0)
                 if (
@@ -1106,7 +1219,7 @@ class BackupDashboard(Star):
                             for old_file in owned[keep_count:]:
                                 old_file.unlink(missing_ok=True)
                                 pruned += 1
-                                logger.info("Pruned old local backup %s", old_file.name)
+                                logger.debug("Pruned old local backup %s", old_file.name)
                         else:
                             pruned = await prune_remote(
                                 collection,
@@ -1124,11 +1237,29 @@ class BackupDashboard(Star):
                             else type(exc).__name__
                         )
                         record["prune_error"] = prune_reason
-                        logger.warning(
-                            "%s backup succeeded, but pruning failed: %s",
-                            mode,
-                            prune_reason,
+                        self._record_log(
+                            "WARNING",
+                            "backup",
+                            f"{mode_label}备份已成功，但清理旧备份失败：{prune_reason}",
+                            f"{mode} backup succeeded, but pruning failed: {prune_reason}",
                         )
+                elapsed_s = monotonic() - started
+                pruned_note_zh = (
+                    f"，已清理 {record['pruned']} 份旧备份"
+                    if record.get("pruned")
+                    else ""
+                )
+                pruned_note_en = (
+                    f", pruned {record['pruned']} old backup(s)"
+                    if record.get("pruned")
+                    else ""
+                )
+                self._record_log(
+                    "INFO",
+                    "backup",
+                    f"{mode_label}备份完成：{name}（{self._format_size(size)}，耗时 {elapsed_s:.1f} s{pruned_note_zh}）",
+                    f"{mode} backup completed: {name} ({self._format_size(size)}, {elapsed_s:.1f}s{pruned_note_en})",
+                )
             except Exception as exc:
                 reason = (
                     str(exc)
@@ -1136,11 +1267,12 @@ class BackupDashboard(Star):
                     else type(exc).__name__
                 )
                 record["error"] = reason
-                logger.error(
-                    "%s backup failed (destination=%s): %s",
-                    mode,
-                    record.get("remote", mode),
-                    reason,
+                mode_label = "本地" if mode == "local" else "WebDAV"
+                self._record_log(
+                    "ERROR",
+                    "backup",
+                    f"{mode_label}备份失败：{reason}",
+                    f"{mode} backup failed: {reason}",
                 )
             finally:
                 record["duration_ms"] = int((monotonic() - started) * 1000)

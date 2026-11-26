@@ -13,6 +13,9 @@ let archiveSource = "local";
 let archiveLoading = false;
 let confirmDeleteKey = null;
 const archivesCache = { local: null, webdav: null };
+let logsItems = [];
+let logsLoaded = false;
+let logLevelFilter = "ALL";
 let busy = false;
 let loading = false;
 let lastSyncAt = null;
@@ -1149,7 +1152,61 @@ function drawForm() {
   fetchCronPreview();
 }
 
-function switchTab(nextTab) {
+  const LOG_CAT_LABELS = {
+    backup: "备份",
+    webdav: "WebDAV",
+    archive: "归档",
+    notify: "通知",
+    system: "系统",
+  };
+
+  function renderLogs() {
+    el("logs-count").textContent = String(logsItems.length);
+    const filtered = logsItems.filter(
+      (item) => logLevelFilter === "ALL" || item.level === logLevelFilter,
+    );
+    if (!filtered.length) {
+      el("logs-list").replaceChildren(
+        node(
+          "p",
+          logsItems.length
+            ? "当前级别筛选下暂无日志。"
+            : "暂无插件运行日志。执行备份、连接测试或归档操作后这里会实时记录。",
+          "empty",
+        ),
+      );
+      return;
+    }
+    const rows = filtered.map((item) => {
+      const row = node("div", undefined, "log-row");
+      row.append(
+        node("span", formatTime(item.time), "log-time"),
+        node("span", item.level || "INFO", `log-level log-level-${item.level || "INFO"}`),
+        node("span", LOG_CAT_LABELS[item.category] || item.category || "系统", "tag"),
+        node("span", item.message || "", "log-msg"),
+      );
+      return row;
+    });
+    el("logs-list").replaceChildren(...rows);
+  }
+
+  async function loadLogs({ silent = false } = {}) {
+    el("refresh-logs-btn").disabled = true;
+    try {
+      const data = await bridge.apiGet("logs");
+      logsItems = Array.isArray(data?.items) ? data.items : [];
+      logsLoaded = true;
+      renderLogs();
+    } catch (err) {
+      if (!silent) {
+        showToast(`读取运行日志失败：${err.message || "请重试"}`, "error");
+      }
+    } finally {
+      el("refresh-logs-btn").disabled = false;
+    }
+  }
+
+  function switchTab(nextTab) {
   activeTab = nextTab;
   confirmDeleteKey = null;
   for (const btn of document.querySelectorAll("[data-tab]")) {
@@ -1158,6 +1215,7 @@ function switchTab(nextTab) {
   }
   el("tab-history").hidden = nextTab !== "history";
   el("tab-archives").hidden = nextTab !== "archives";
+  el("tab-logs").hidden = nextTab !== "logs";
   el("tab-settings").hidden = nextTab !== "settings";
   if (nextTab === "settings") {
     drawForm();
@@ -1167,6 +1225,12 @@ function switchTab(nextTab) {
       loadArchives(archiveSource, { silent: true });
     } else {
       renderArchives();
+    }
+  } else if (nextTab === "logs") {
+    if (!logsLoaded) {
+      loadLogs({ silent: true });
+    } else {
+      renderLogs();
     }
   }
 }
@@ -1183,6 +1247,9 @@ function renderAll() {
   renderKpis();
   renderCards();
   renderHistory();
+  if (!logsLoaded && Number.isFinite(model.log_count)) {
+    el("logs-count").textContent = String(model.log_count);
+  }
   updateDirtyIndicators();
 }
 
@@ -1228,6 +1295,22 @@ function handleSSEEvent(event) {
       }
     } else {
       renderCards();
+    }
+    return;
+  }
+  if (event.eventType === "log" && data.message) {
+    if (logsLoaded) {
+      if (!logsItems.some((item) => item.id === data.id)) {
+        logsItems = [data, ...logsItems].slice(0, 200);
+      }
+      if (activeTab === "logs") {
+        renderLogs();
+      } else {
+        el("logs-count").textContent = String(logsItems.length);
+      }
+    } else {
+      const cur = Number.parseInt(el("logs-count").textContent || "0", 10) || 0;
+      el("logs-count").textContent = String(Math.min(200, cur + 1));
     }
     return;
   }
@@ -1360,6 +1443,47 @@ for (const btn of document.querySelectorAll("[data-archive-source]")) {
 }
 
 el("refresh-archives-btn").onclick = () => loadArchives(archiveSource);
+
+for (const btn of document.querySelectorAll("[data-log-level]")) {
+  btn.onclick = () => {
+    logLevelFilter = btn.dataset.logLevel;
+    for (const b of document.querySelectorAll("[data-log-level]")) {
+      b.setAttribute("aria-pressed", String(b.dataset.logLevel === logLevelFilter));
+    }
+    renderLogs();
+  };
+}
+
+el("refresh-logs-btn").onclick = () => loadLogs();
+
+el("copy-logs-btn").onclick = () => {
+  const filtered = logsItems.filter(
+    (item) => logLevelFilter === "ALL" || item.level === logLevelFilter,
+  );
+  if (!filtered.length) {
+    showToast("当前没有可复制的日志", "info");
+    return;
+  }
+  const text = filtered
+    .map((item) => `[${formatTime(item.time)}] [${item.level}] [${item.category}] ${item.message}`)
+    .join("\n");
+  copyText(text);
+};
+
+el("clear-logs-btn").onclick = async () => {
+  el("clear-logs-btn").disabled = true;
+  try {
+    await bridge.apiPost("logs/clear", {});
+    logsItems = [];
+    logsLoaded = true;
+    renderLogs();
+    showToast("运行日志已清空", "success");
+  } catch (err) {
+    showToast(`清空失败：${err.message || "请重试"}`, "error");
+  } finally {
+    el("clear-logs-btn").disabled = false;
+  }
+};
 
 for (const btn of document.querySelectorAll("[data-filter-mode]")) {
   btn.onclick = () => {

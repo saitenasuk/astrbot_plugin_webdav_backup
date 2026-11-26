@@ -86,10 +86,10 @@ async def _request(session, method, url, expected, **kwargs):
         WebDAVError: If the request fails or the server rejects it.
     """
     start = monotonic()
-    logger.info("WebDAV %s %s started", method, url)
+    logger.debug("WebDAV %s %s started", method, url)
     try:
         async with session.request(method, url, allow_redirects=False, **kwargs) as res:
-            logger.info(
+            logger.debug(
                 "WebDAV %s %s returned HTTP %d (%.2fs)",
                 method,
                 url,
@@ -214,12 +214,12 @@ async def _verify(session, final, size):
                 raise WebDAVError(
                     f"WebDAV 远端文件大小不符（远端 {reported} 字节，本地 {size} 字节）"
                 )
-            logger.info(
+            logger.debug(
                 "WebDAV verified %s (%d bytes, PROPFIND Depth=%s)", final, size, depth
             )
             return
         if depth == "0":
-            logger.info(
+            logger.debug(
                 "WebDAV PROPFIND Depth=0 inconclusive for %s (%d entries, %d collections, %d length properties), checking parent collection",
                 final,
                 len(root.findall("{DAV:}response")),
@@ -292,25 +292,35 @@ async def upload(
                         chunk = file.read(64 * 1024)
                         if not chunk:
                             break
+                        yield chunk
                         sent += len(chunk)
                         now = monotonic()
                         if sent >= size or now - last_emit >= 0.25:
                             last_emit = now
                             elapsed = max(now - started, 0.001)
+                            pct = min(99.0, round((sent / size) * 99.0, 1)) if size else 99.0
                             on_progress(
                                 {
                                     "stage": "upload",
                                     "detail": "正在上传备份包到 WebDAV…",
-                                    "percent": round((sent / size) * 100.0, 1)
-                                    if size
-                                    else 100.0,
+                                    "percent": pct,
                                     "determinate": True,
                                     "current": sent,
                                     "total": size,
                                     "rate_bps": int(sent / elapsed),
                                 }
                             )
-                        yield chunk
+                    # All bytes have been handed to the transport; server may still commit upstream.
+                    on_progress(
+                        {
+                            "stage": "commit",
+                            "detail": "数据已全部发送，等待 WebDAV 服务端写入响应…",
+                            "percent": 99.0,
+                            "determinate": False,
+                            "current": size,
+                            "total": size,
+                        }
+                    )
 
                 body = _stream_chunks()
             else:
@@ -485,8 +495,10 @@ async def download_remote(
     dest_path: Path,
     username: str,
     password: str,
+    *,
+    allow_http: bool = False,
 ) -> int:
-    """Stream a remote WebDAV backup ZIP to a local staging file.
+    """Stream a remote WebDAV backup ZIP to a local staging file, handling redirects safely.
 
     Args:
         collection: Validated URL of an existing WebDAV collection with trailing slash.
@@ -494,32 +506,70 @@ async def download_remote(
         dest_path: Destination file path inside a temporary staging directory.
         username: WebDAV user.
         password: WebDAV password.
+        allow_http: Allow cleartext HTTP on redirect targets when enabled.
 
     Returns:
         Number of bytes written to ``dest_path``.
 
     Raises:
-        WebDAVError: If the download fails or the response is truncated.
+        WebDAVError: If the download fails, redirects are invalid, or data is truncated.
     """
-    target = collection + quote(name, safe="")
-    headers = {}
-    if username:
-        encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
-        headers["Authorization"] = f"Basic {encoded}"
+    origin = URL(collection).origin()
+    current_url = collection + quote(name, safe="")
+    auth_header = (
+        f"Basic {b64encode(f'{username}:{password}'.encode()).decode('ascii')}"
+        if username
+        else None
+    )
     timeout = aiohttp.ClientTimeout(total=3600, sock_connect=30, sock_read=300)
-    written = 0
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        async with _request(session, "GET", target, (200,)) as res:
-            expected_len = res.content_length
-            with dest_path.open("wb") as handle:
-                async for chunk in res.content.iter_chunked(64 * 1024):
-                    handle.write(chunk)
-                    written += len(chunk)
-    if expected_len is not None and written != expected_len:
-        raise WebDAVError(
-            f"WebDAV 下载不完整（已接收 {written} 字节，预期 {expected_len} 字节）"
-        )
-    return written
+    allowed_schemes = ("https", "http") if allow_http else ("https",)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(6):
+            req_headers = {}
+            if auth_header and URL(current_url).origin() == origin:
+                req_headers["Authorization"] = auth_header
+            async with _request(
+                session,
+                "GET",
+                current_url,
+                (200, 301, 302, 303, 307, 308),
+                headers=req_headers,
+            ) as res:
+                if res.status in (301, 302, 303, 307, 308):
+                    location = (res.headers.get("Location") or "").strip()
+                    if not location:
+                        raise WebDAVError(
+                            f"WebDAV GET 返回 HTTP {res.status}，但缺少 Location 重定向地址"
+                        )
+                    try:
+                        next_uri = URL(current_url).join(URL(location))
+                    except ValueError as exc:
+                        raise WebDAVError("WebDAV GET 重定向地址无效") from exc
+                    if next_uri.scheme not in allowed_schemes or not next_uri.host:
+                        raise WebDAVError(
+                            f"WebDAV GET 重定向协议不受支持（{next_uri.scheme or 'unknown'}）"
+                        )
+                    logger.debug(
+                        "WebDAV GET following HTTP %d redirect to %s",
+                        res.status,
+                        next_uri.host,
+                    )
+                    current_url = str(next_uri)
+                    continue
+
+                expected_len = res.content_length
+                written = 0
+                with dest_path.open("wb") as handle:
+                    async for chunk in res.content.iter_chunked(64 * 1024):
+                        handle.write(chunk)
+                        written += len(chunk)
+                if expected_len is not None and written != expected_len:
+                    raise WebDAVError(
+                        f"WebDAV 下载不完整（已接收 {written} 字节，预期 {expected_len} 字节）"
+                    )
+                return written
+    raise WebDAVError("WebDAV GET 重定向次数过多")
 
 
 async def delete_remote(
@@ -595,5 +645,5 @@ async def prune_remote(
             async with _request(session, "DELETE", item["url"], (200, 204, 404)):
                 pass
             deleted += 1
-            logger.info("Pruned old remote backup %s", item["name"])
+            logger.debug("Pruned old remote backup %s", item["name"])
     return deleted
