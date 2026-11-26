@@ -483,3 +483,142 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
                 plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=bad))
             ):
                 self.assertEqual((await self.bot.cron_preview()).status_code, 400)
+
+    async def test_local_archive_list_download_and_delete(self):
+        backups = self.data / 'backups'
+        backups.mkdir(exist_ok=True)
+        owned = backups / 'astrbot_backup_20260101_020000_local_abcdef123456.zip'
+        other = backups / 'manual_export.zip'
+        with ZipFile(owned, 'w') as zf:
+            zf.writestr('manifest.json', '{}')
+        with ZipFile(other, 'w') as zf:
+            zf.writestr('manifest.json', '{}')
+
+        listed = json.loads((await self.bot.list_local_archives()).body)
+        by_name = {item['name']: item for item in listed['items']}
+        self.assertEqual(set(by_name), {owned.name, other.name})
+        self.assertTrue(by_name[owned.name]['owned'])
+        self.assertFalse(by_name[other.name]['owned'])
+
+        # Download valid and invalid filenames
+        with patch.object(
+            plugin, 'request', SimpleNamespace(query={'name': owned.name})
+        ):
+            res = await self.bot.download_local_archive()
+            self.assertEqual(res.status_code, 200)
+        for bad in ('', '../secret.zip', 'sub/a.zip', 'notzip.txt', 'missing.zip'):
+            with self.subTest(bad=bad), patch.object(
+                plugin, 'request', SimpleNamespace(query={'name': bad})
+            ):
+                res = await self.bot.download_local_archive()
+                self.assertIn(res.status_code, (400, 404))
+
+        # Delete valid and invalid filenames
+        with patch.object(
+            plugin,
+            'request',
+            SimpleNamespace(json=AsyncMock(return_value={'name': other.name})),
+        ):
+            res = await self.bot.delete_local_archive()
+            self.assertEqual(res.status_code, 200)
+        self.assertFalse(other.exists())
+        self.assertTrue(owned.exists())
+
+        with patch.object(
+            plugin,
+            'request',
+            SimpleNamespace(json=AsyncMock(return_value={'name': '../owned.zip'})),
+        ):
+            self.assertEqual((await self.bot.delete_local_archive()).status_code, 400)
+
+    async def test_webdav_archive_list_pull_and_delete(self):
+        prefix = '/mount/dav/backups/'
+        valid_buf = self.data / 'sample_valid.zip'
+        with ZipFile(valid_buf, 'w') as zf:
+            zf.writestr('manifest.json', '{"ok": true}')
+        remote_files = {
+            'astrbot_backup_20260101_030000_webdav_abcdef123456.zip': valid_buf.read_bytes(),
+            'corrupt.zip': b'<html>not a zip</html>',
+        }
+
+        async def handle(request):
+            name = request.match_info['name']
+            if request.method == 'PROPFIND':
+                entries = [
+                    f'<D:response><D:href>{prefix}</D:href>'
+                    '<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>'
+                    '<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+                ]
+                for fname, content in remote_files.items():
+                    entries.append(
+                        f'<D:response><D:href>{prefix}{escape(fname)}</D:href>'
+                        f'<D:propstat><D:prop><D:getcontentlength>{len(content)}</D:getcontentlength>'
+                        '<D:getlastmodified>Thu, 01 Jan 2026 03:00:00 GMT</D:getlastmodified></D:prop>'
+                        '<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+                    )
+                return web.Response(
+                    status=207,
+                    content_type='application/xml',
+                    text=f'<D:multistatus xmlns:D="DAV:">{"".join(entries)}</D:multistatus>',
+                )
+            if request.method == 'GET':
+                if name not in remote_files:
+                    return web.Response(status=404)
+                return web.Response(body=remote_files[name])
+            if request.method == 'DELETE':
+                remote_files.pop(name, None)
+                return web.Response(status=204)
+            return web.Response(status=405)
+
+        app = web.Application()
+        app.router.add_route('*', '/mount/dav/backups/{name:.*}', handle)
+        async with TestServer(app) as server:
+            self.config.update(
+                url=str(server.make_url('/mount/dav/')),
+                remote_dir='/backups',
+                username='backup',
+                password='secret',
+                allow_http=True,
+            )
+            listed = json.loads((await self.bot.list_webdav_archives()).body)
+            by_name = {item['name']: item for item in listed['items']}
+            target_name = 'astrbot_backup_20260101_030000_webdav_abcdef123456.zip'
+            self.assertIn(target_name, by_name)
+            self.assertTrue(by_name[target_name]['owned'])
+            self.assertFalse(by_name[target_name]['exists_local'])
+
+            # Pull valid ZIP into data/backups
+            with patch.object(
+                plugin,
+                'request',
+                SimpleNamespace(json=AsyncMock(return_value={'name': target_name})),
+            ):
+                res = await self.bot.pull_webdav_archive()
+            self.assertEqual(res.status_code, 200)
+            self.assertTrue((self.data / 'backups' / target_name).is_file())
+
+            # Duplicate pull returns 409
+            with patch.object(
+                plugin,
+                'request',
+                SimpleNamespace(json=AsyncMock(return_value={'name': target_name})),
+            ):
+                self.assertEqual((await self.bot.pull_webdav_archive()).status_code, 409)
+
+            # Corrupt remote ZIP is rejected and not written to data/backups
+            with patch.object(
+                plugin,
+                'request',
+                SimpleNamespace(json=AsyncMock(return_value={'name': 'corrupt.zip'})),
+            ):
+                self.assertEqual((await self.bot.pull_webdav_archive()).status_code, 502)
+            self.assertFalse((self.data / 'backups' / 'corrupt.zip').exists())
+
+            # Delete remote ZIP
+            with patch.object(
+                plugin,
+                'request',
+                SimpleNamespace(json=AsyncMock(return_value={'name': 'corrupt.zip'})),
+            ):
+                self.assertEqual((await self.bot.delete_webdav_archive()).status_code, 200)
+            self.assertNotIn('corrupt.zip', remote_files)

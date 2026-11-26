@@ -1,6 +1,8 @@
 import asyncio
 from base64 import b64encode
 from contextlib import asynccontextmanager
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from time import monotonic
 from urllib.parse import quote, unquote
@@ -280,6 +282,205 @@ async def upload(
                 pass
 
 
+async def list_remote(
+    collection: str,
+    username: str,
+    password: str,
+) -> list[dict]:
+    """List direct child ZIP files in a WebDAV collection.
+
+    Args:
+        collection: Validated URL of an existing WebDAV collection with trailing slash.
+        username: WebDAV user.
+        password: WebDAV password.
+
+    Returns:
+        List of dicts with keys ``name``, ``size``, ``modified``, and ``url``,
+        sorted newest-first.
+
+    Raises:
+        WebDAVError: If listing or parsing the WebDAV collection fails.
+    """
+    headers = {}
+    if username:
+        encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=20, sock_read=30)
+    collection_uri = URL(collection)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with _request(
+            session,
+            "PROPFIND",
+            collection,
+            (207,),
+            headers={
+                "Depth": "1",
+                "Content-Type": "application/xml; charset=utf-8",
+                "Cache-Control": "no-cache",
+            },
+            data=(
+                b'<propfind xmlns="DAV:"><prop>'
+                b"<getcontentlength/><getlastmodified/><resourcetype/>"
+                b"</prop></propfind>"
+            ),
+        ) as res:
+            limit = 4 * 1024 * 1024
+            try:
+                await res.content.readexactly(limit + 1)
+            except asyncio.IncompleteReadError as exc:
+                xml = exc.partial
+            else:
+                raise WebDAVError(
+                    f"WebDAV PROPFIND Depth=1 返回的属性超过 {limit // 1024} KiB"
+                )
+    try:
+        root = ElementTree.fromstring(xml, forbid_dtd=True)
+    except (
+        ElementTree.ParseError,
+        DefusedXmlException,
+        LookupError,
+        ValueError,
+    ) as exc:
+        raise WebDAVError("WebDAV PROPFIND 列表解析失败，请检查服务地址") from exc
+    if root.tag != "{DAV:}multistatus":
+        raise WebDAVError("WebDAV PROPFIND 缺少 DAV multistatus，请检查服务地址")
+
+    items: dict[str, dict] = {}
+    for response in root.findall("{DAV:}response"):
+        href = (response.findtext("{DAV:}href") or "").strip()
+        if not href:
+            continue
+        try:
+            resource = collection_uri.join(URL(href))
+        except ValueError:
+            continue
+        if resource == collection_uri or str(resource).endswith("/"):
+            continue
+        if resource.origin() != collection_uri.origin():
+            continue
+        if str(resource.parent).rstrip("/") + "/" != str(collection_uri):
+            continue
+        is_collection = False
+        size = None
+        modified = ""
+        for propstat in response.findall("{DAV:}propstat"):
+            status = (propstat.findtext("{DAV:}status") or "").split()
+            if len(status) < 2 or status[1] != "200":
+                continue
+            prop = propstat.find("{DAV:}prop")
+            if prop is None:
+                continue
+            if prop.find("{DAV:}resourcetype/{DAV:}collection") is not None:
+                is_collection = True
+                break
+            length = (prop.findtext("{DAV:}getcontentlength") or "").strip()
+            if length.isascii() and length.isdecimal() and len(length) <= 20:
+                size = int(length)
+            raw_mod = (prop.findtext("{DAV:}getlastmodified") or "").strip()
+            if raw_mod:
+                try:
+                    dt = parsedate_to_datetime(raw_mod)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    modified = dt.astimezone(timezone.utc).isoformat()
+                except (TypeError, ValueError):
+                    pass
+        if is_collection:
+            continue
+        name = resource.name
+        if (
+            not name
+            or not name.endswith(".zip")
+            or "/" in name
+            or "\\" in name
+            or name in (".", "..")
+        ):
+            continue
+        items[name] = {
+            "name": name,
+            "size": size,
+            "modified": modified,
+            "url": str(resource),
+        }
+
+    return sorted(
+        items.values(),
+        key=lambda item: (item["modified"] or "", item["name"]),
+        reverse=True,
+    )
+
+
+async def download_remote(
+    collection: str,
+    name: str,
+    dest_path: Path,
+    username: str,
+    password: str,
+) -> int:
+    """Stream a remote WebDAV backup ZIP to a local staging file.
+
+    Args:
+        collection: Validated URL of an existing WebDAV collection with trailing slash.
+        name: Safe single-segment ZIP filename.
+        dest_path: Destination file path inside a temporary staging directory.
+        username: WebDAV user.
+        password: WebDAV password.
+
+    Returns:
+        Number of bytes written to ``dest_path``.
+
+    Raises:
+        WebDAVError: If the download fails or the response is truncated.
+    """
+    target = collection + quote(name, safe="")
+    headers = {}
+    if username:
+        encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+    timeout = aiohttp.ClientTimeout(total=3600, sock_connect=30, sock_read=300)
+    written = 0
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with _request(session, "GET", target, (200,)) as res:
+            expected_len = res.content_length
+            with dest_path.open("wb") as handle:
+                async for chunk in res.content.iter_chunked(64 * 1024):
+                    handle.write(chunk)
+                    written += len(chunk)
+    if expected_len is not None and written != expected_len:
+        raise WebDAVError(
+            f"WebDAV 下载不完整（已接收 {written} 字节，预期 {expected_len} 字节）"
+        )
+    return written
+
+
+async def delete_remote(
+    collection: str,
+    name: str,
+    username: str,
+    password: str,
+) -> None:
+    """Delete a single ZIP file from a WebDAV collection.
+
+    Args:
+        collection: Validated URL of an existing WebDAV collection with trailing slash.
+        name: Safe single-segment ZIP filename.
+        username: WebDAV user.
+        password: WebDAV password.
+
+    Raises:
+        WebDAVError: If the DELETE request fails.
+    """
+    target = collection + quote(name, safe="")
+    headers = {}
+    if username:
+        encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {encoded}"
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=20, sock_read=30)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with _request(session, "DELETE", target, (200, 204, 404)):
+            pass
+
+
 async def prune_remote(
     collection: str,
     username: str,
@@ -304,86 +505,26 @@ async def prune_remote(
     """
     if keep_count <= 0:
         return 0
+    items = await list_remote(collection, username, password)
+    # Filenames embed UTC YYYYMMDD_HHMMSS, so descending order puts newest first.
+    matched = sorted(
+        (item for item in items if filename_pattern.fullmatch(item["name"])),
+        key=lambda item: item["name"],
+        reverse=True,
+    )
+    stale = matched[keep_count:]
+    if not stale:
+        return 0
     headers = {}
     if username:
         encoded = b64encode(f"{username}:{password}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {encoded}"
     timeout = aiohttp.ClientTimeout(total=120, sock_connect=30, sock_read=60)
-    collection_uri = URL(collection)
+    deleted = 0
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        async with _request(
-            session,
-            "PROPFIND",
-            collection,
-            (207,),
-            headers={
-                "Depth": "1",
-                "Content-Type": "application/xml; charset=utf-8",
-                "Cache-Control": "no-cache",
-            },
-            data=b'<propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>',
-        ) as res:
-            limit = 4 * 1024 * 1024
-            try:
-                await res.content.readexactly(limit + 1)
-            except asyncio.IncompleteReadError as exc:
-                xml = exc.partial
-            else:
-                raise WebDAVError(
-                    f"WebDAV PROPFIND Depth=1 返回的属性超过 {limit // 1024} KiB"
-                )
-        try:
-            root = ElementTree.fromstring(xml, forbid_dtd=True)
-        except (
-            ElementTree.ParseError,
-            DefusedXmlException,
-            LookupError,
-            ValueError,
-        ) as exc:
-            raise WebDAVError("WebDAV PROPFIND 列表解析失败，无法清理旧备份") from exc
-        if root.tag != "{DAV:}multistatus":
-            raise WebDAVError("WebDAV PROPFIND 缺少 DAV multistatus，无法清理旧备份")
-
-        matches: dict[str, str] = {}
-        for response in root.findall("{DAV:}response"):
-            href = (response.findtext("{DAV:}href") or "").strip()
-            if not href:
-                continue
-            try:
-                resource = collection_uri.join(URL(href))
-            except ValueError:
-                continue
-            if resource == collection_uri or str(resource).endswith("/"):
-                continue
-            if resource.origin() != collection_uri.origin():
-                continue
-            if str(resource.parent).rstrip("/") + "/" != str(collection_uri):
-                continue
-            is_collection = False
-            for propstat in response.findall("{DAV:}propstat"):
-                status = (propstat.findtext("{DAV:}status") or "").split()
-                if len(status) < 2 or status[1] != "200":
-                    continue
-                prop = propstat.find("{DAV:}prop")
-                if (
-                    prop is not None
-                    and prop.find("{DAV:}resourcetype/{DAV:}collection") is not None
-                ):
-                    is_collection = True
-                    break
-            if is_collection:
-                continue
-            name = resource.name
-            if filename_pattern.fullmatch(name):
-                matches[name] = str(resource)
-
-        # Filenames embed UTC YYYYMMDD_HHMMSS, so descending order puts newest first.
-        ordered = sorted(matches.items(), key=lambda item: item[0], reverse=True)
-        stale = ordered[keep_count:]
-        deleted = 0
-        for name, target_url in stale:
-            async with _request(session, "DELETE", target_url, (200, 204, 404)):
+        for item in stale:
+            async with _request(session, "DELETE", item["url"], (200, 204, 404)):
                 pass
             deleted += 1
-            logger.info("Pruned old remote backup %s", name)
-        return deleted
+            logger.info("Pruned old remote backup %s", item["name"])
+    return deleted

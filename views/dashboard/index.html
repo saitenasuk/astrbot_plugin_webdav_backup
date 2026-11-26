@@ -16,7 +16,7 @@
             <span id="health-badge" class="pill pill-neutral">读取中…</span>
           </div>
           <p class="subtitle">
-            监控本地与 WebDAV 备份状态、自动保留策略与历史记录，生成 AstrBot 原生 ZIP。
+            监控本地与 WebDAV 备份状态、管理归档文件与自动保留策略，生成 AstrBot 原生 ZIP。
           </p>
         </div>
         <div class="topbar-actions">
@@ -44,6 +44,17 @@
             class="tab-btn"
           >
             运行历史 <span id="history-count" class="tab-count">0</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-btn-archives"
+            data-tab="archives"
+            aria-selected="false"
+            aria-controls="tab-archives"
+            class="tab-btn"
+          >
+            备份文件 <span id="archives-count" class="tab-count">0</span>
           </button>
           <button
             type="button"
@@ -126,6 +137,43 @@
           </div>
           <div id="history" class="history-list">
             <p class="empty">正在读取运行记录…</p>
+          </div>
+        </div>
+
+        <div
+          id="tab-archives"
+          role="tabpanel"
+          aria-labelledby="tab-btn-archives"
+          class="tab-panel"
+          hidden
+        >
+          <div class="archives-head">
+            <div role="group" aria-label="选择归档位置" class="segmented">
+              <button
+                type="button"
+                data-archive-source="local"
+                aria-pressed="true"
+              >
+                本地备份
+              </button>
+              <button
+                type="button"
+                data-archive-source="webdav"
+                aria-pressed="false"
+              >
+                WebDAV 远端
+              </button>
+            </div>
+            <div class="archives-tools">
+              <span id="archives-summary" class="sync-meta"></span>
+              <button id="refresh-archives-btn" type="button" class="btn btn-sm">
+                刷新列表
+              </button>
+            </div>
+          </div>
+          <p id="archives-tip" class="tip-banner"></p>
+          <div id="archives-list" class="archive-list">
+            <p class="empty">点击上方位置加载备份文件列表。</p>
           </div>
         </div>
 

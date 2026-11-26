@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,11 +15,19 @@ from yarl import URL
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.api.web import error_response, json_response, request
+from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .archive import NAME, create_archive
-from .webdav import WebDAVError, collection_url, prune_remote, upload
+from .webdav import (
+    WebDAVError,
+    collection_url,
+    delete_remote,
+    download_remote,
+    list_remote,
+    prune_remote,
+    upload,
+)
 
 SCHEMA = json.loads(Path(__file__).with_name("_conf_schema.json").read_text("utf-8"))
 MODES = ("local", "webdav")
@@ -56,6 +64,12 @@ class BackupDashboard(Star):
             ("cron-preview", "POST", self.cron_preview),
             ("test-connection", "POST", self.test_connection),
             ("run", "POST", self.run_now),
+            ("archives/local", "GET", self.list_local_archives),
+            ("archives/local/download", "GET", self.download_local_archive),
+            ("archives/local/delete", "POST", self.delete_local_archive),
+            ("archives/webdav", "GET", self.list_webdav_archives),
+            ("archives/webdav/pull", "POST", self.pull_webdav_archive),
+            ("archives/webdav/delete", "POST", self.delete_webdav_archive),
         ]:
             context.register_web_api(
                 f"/{NAME}/{endpoint}", handler, [method], f"Backup {endpoint}"
@@ -321,6 +335,246 @@ class BackupDashboard(Star):
         if not self._enqueue(mode, trigger="manual"):
             return error_response("任务已排队或正在运行", status_code=409)
         return json_response({"queued": True})
+
+    @staticmethod
+    def _validate_zip_name(name: object) -> str:
+        """Validate a single-segment ZIP archive filename from user input.
+
+        Args:
+            name: Candidate filename value from request query or JSON body.
+
+        Returns:
+            Normalized safe ZIP filename.
+
+        Raises:
+            ValueError: If the filename is unsafe or not a ZIP archive.
+        """
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 255
+            or not name.endswith(".zip")
+            or "/" in name
+            or "\\" in name
+            or name in (".", "..")
+            or Path(name).name != name
+            or any(ord(ch) < 32 for ch in name)
+        ):
+            raise ValueError("备份文件名无效")
+        return name
+
+    async def list_local_archives(self):
+        """List ZIP archives stored in AstrBot's local backups directory.
+
+        Returns:
+            A JSON response with archive metadata sorted newest-first.
+        """
+        backups_dir = Path(get_astrbot_data_path()) / "backups"
+        items = []
+        total_size = 0
+        if backups_dir.is_dir():
+            try:
+                for entry in backups_dir.iterdir():
+                    if (
+                        entry.is_symlink()
+                        or not entry.is_file()
+                        or not entry.name.endswith(".zip")
+                    ):
+                        continue
+                    try:
+                        stat = entry.stat()
+                    except OSError:
+                        continue
+                    total_size += stat.st_size
+                    items.append(
+                        {
+                            "name": entry.name,
+                            "size": stat.st_size,
+                            "modified": datetime.fromtimestamp(
+                                stat.st_mtime, tz=timezone.utc
+                            ).isoformat(),
+                            "owned": bool(
+                                BACKUP_NAME_PATTERNS["local"].fullmatch(entry.name)
+                            ),
+                        }
+                    )
+            except OSError:
+                return error_response("无法读取本地备份目录", status_code=500)
+        items.sort(key=lambda item: (item["modified"], item["name"]), reverse=True)
+        return json_response({"items": items, "total_size": total_size})
+
+    async def download_local_archive(self):
+        """Download a validated local backup ZIP via AstrBot file_response.
+
+        Returns:
+            A file download response or an error response if missing/invalid.
+        """
+        try:
+            name = self._validate_zip_name(request.query.get("name", ""))
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        backups_dir = (Path(get_astrbot_data_path()) / "backups").resolve()
+        target = (backups_dir / name).resolve()
+        if (
+            target.parent != backups_dir
+            or target.is_symlink()
+            or not target.is_file()
+        ):
+            return error_response("本地备份文件不存在", status_code=404)
+        return file_response(target, filename=name, content_type="application/zip")
+
+    async def delete_local_archive(self):
+        """Delete a validated local backup ZIP from data/backups.
+
+        Returns:
+            A JSON response confirming deletion or an error response.
+        """
+        payload = await request.json(default=None)
+        raw_name = payload.get("name") if isinstance(payload, dict) else None
+        try:
+            name = self._validate_zip_name(raw_name)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        backups_dir = (Path(get_astrbot_data_path()) / "backups").resolve()
+        target = (backups_dir / name).resolve()
+        if (
+            target.parent != backups_dir
+            or target.is_symlink()
+            or not target.is_file()
+        ):
+            return error_response("本地备份文件不存在", status_code=404)
+        try:
+            target.unlink()
+        except OSError as exc:
+            logger.warning("Failed to delete local backup %s: %s", name, exc)
+            return error_response("删除本地备份失败", status_code=500)
+        logger.info("Deleted local backup %s", name)
+        return json_response({"deleted": True, "name": name})
+
+    async def list_webdav_archives(self):
+        """List ZIP archives in the configured WebDAV remote directory.
+
+        Returns:
+            A JSON response containing remote ZIP metadata or an error response.
+        """
+        try:
+            collection = collection_url(
+                self.config.get("url", ""),
+                self.config.get("allow_http", False),
+                self.config.get("remote_dir", "/"),
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        try:
+            raw_items = await list_remote(
+                collection,
+                self.config.get("username", ""),
+                self.config.get("password", ""),
+            )
+        except (WebDAVError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
+            logger.warning("WebDAV list failed for %s: %s", collection, reason)
+            return error_response(reason, status_code=502)
+        backups_dir = Path(get_astrbot_data_path()) / "backups"
+        total_size = 0
+        items = []
+        for item in raw_items:
+            if isinstance(item["size"], int):
+                total_size += item["size"]
+            items.append(
+                {
+                    "name": item["name"],
+                    "size": item["size"],
+                    "modified": item["modified"],
+                    "owned": bool(
+                        BACKUP_NAME_PATTERNS["webdav"].fullmatch(item["name"])
+                    ),
+                    "exists_local": (backups_dir / item["name"]).is_file(),
+                }
+            )
+        return json_response(
+            {"items": items, "total_size": total_size, "collection": collection}
+        )
+
+    async def pull_webdav_archive(self):
+        """Pull a remote WebDAV backup ZIP into local data/backups for native restore.
+
+        Returns:
+            A JSON response with the saved local filename and size, or an error.
+        """
+        payload = await request.json(default=None)
+        raw_name = payload.get("name") if isinstance(payload, dict) else None
+        try:
+            name = self._validate_zip_name(raw_name)
+            collection = collection_url(
+                self.config.get("url", ""),
+                self.config.get("allow_http", False),
+                self.config.get("remote_dir", "/"),
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        backups_dir = Path(get_astrbot_data_path()) / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        final_path = backups_dir / name
+        if final_path.exists() or final_path.is_symlink():
+            return error_response("本地已存在同名备份文件", status_code=409)
+        try:
+            with tempfile.TemporaryDirectory(prefix=".pull-", dir=backups_dir) as work:
+                staged = Path(work) / name
+                size = await download_remote(
+                    collection,
+                    name,
+                    staged,
+                    self.config.get("username", ""),
+                    self.config.get("password", ""),
+                )
+
+                def _verify_zip(path: Path) -> None:
+                    with ZipFile(path, "r") as zf:
+                        if not zf.namelist():
+                            raise BadZipFile("empty archive")
+
+                await asyncio.to_thread(_verify_zip, staged)
+                staged.replace(final_path)
+        except BadZipFile:
+            return error_response("远端文件不是有效的 ZIP 备份包", status_code=502)
+        except (WebDAVError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
+            logger.warning("WebDAV pull failed for %s: %s", name, reason)
+            return error_response(reason, status_code=502)
+        logger.info("Pulled remote backup %s to local (%d bytes)", name, size)
+        return json_response({"pulled": True, "name": name, "size": size})
+
+    async def delete_webdav_archive(self):
+        """Delete a single validated ZIP archive from the WebDAV remote directory.
+
+        Returns:
+            A JSON response confirming remote deletion or an error response.
+        """
+        payload = await request.json(default=None)
+        raw_name = payload.get("name") if isinstance(payload, dict) else None
+        try:
+            name = self._validate_zip_name(raw_name)
+            collection = collection_url(
+                self.config.get("url", ""),
+                self.config.get("allow_http", False),
+                self.config.get("remote_dir", "/"),
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        try:
+            await delete_remote(
+                collection,
+                name,
+                self.config.get("username", ""),
+                self.config.get("password", ""),
+            )
+        except (WebDAVError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, WebDAVError) else type(exc).__name__
+            logger.warning("WebDAV delete failed for %s: %s", name, reason)
+            return error_response(reason, status_code=502)
+        logger.info("Deleted remote backup %s", name)
+        return json_response({"deleted": True, "name": name})
 
     async def _backup(self, mode, trigger: str = "manual"):
         async with self.lock:

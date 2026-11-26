@@ -2,18 +2,56 @@ const bridge = window.AstrBotPluginView;
 const el = (id) => document.getElementById(id);
 const NAMES = { local: "本地", webdav: "WebDAV" };
 const drafts = {};
+const systemDarkQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 let model = null;
 let activeTab = "history";
 let mode = "local";
 let filterMode = "all";
 let filterStatus = "all";
+let archiveSource = "local";
+let archiveLoading = false;
+let confirmDeleteKey = null;
+const archivesCache = { local: null, webdav: null };
 let busy = false;
 let loading = false;
 let lastSyncAt = null;
 let toastTimer = null;
 let cronPreviewTimer = null;
 let pollTimer = null;
+
+function applyHostTheme(ctx) {
+  const root = document.documentElement;
+  const dark =
+    typeof ctx?.isDark === "boolean"
+      ? ctx.isDark
+      : root.dataset.theme === "dark" ||
+        (root.dataset.theme !== "light" && systemDarkQuery.matches);
+  root.setAttribute("data-theme", dark ? "dark" : "light");
+  root.style.setProperty("color-scheme", dark ? "dark" : "light");
+
+  const colors = ctx?.themeColors;
+  if (colors && typeof colors === "object") {
+    const tokenMap = {
+      primary: colors.primary,
+      secondary: colors.secondary,
+      "on-primary": colors["on-primary"],
+      text: colors.primaryText || colors["on-surface"],
+      "text-secondary": colors.secondaryText,
+      background: colors.background,
+      surface: colors.surface,
+      border: colors.border,
+      error: colors.error,
+    };
+    for (const [name, value] of Object.entries(tokenMap)) {
+      if (typeof value === "string" && value.trim()) {
+        root.style.setProperty(`--astrbot-color-${name}`, value);
+      } else {
+        root.style.removeProperty(`--astrbot-color-${name}`);
+      }
+    }
+  }
+}
 
 function node(tag, text, cls) {
   const element = document.createElement(tag);
@@ -28,7 +66,8 @@ function formatTime(iso) {
 }
 
 function formatBytes(size) {
-  if (!Number.isFinite(size) || size <= 0) return "0 B";
+  if (!Number.isFinite(size) || size < 0) return "未知大小";
+  if (size === 0) return "0 B";
   if (size < 1024) return `${size} B`;
   if (size < 1048576) return `${(size / 1024).toFixed(1)} KiB`;
   if (size < 1073741824) return `${(size / 1048576).toFixed(1)} MiB`;
@@ -205,16 +244,22 @@ function renderKpis() {
     kpiRate.append(node("span", "完成首次备份后展示运行趋势", "kpi-sub"));
   }
 
-  // KPI 4: Local storage usage
+  // KPI 4: Local storage usage (click opens Archives tab)
   const storage = model.local_storage || {
     total_count: 0,
     total_size: 0,
     plugin_count: 0,
     plugin_size: 0,
   };
-  const kpiStore = node("article", undefined, "kpi-card");
-  kpiStore.append(node("span", "本地备份占用", "kpi-label"));
+  el("archives-count").textContent = String(storage.total_count);
+  const kpiStore = node("article", undefined, "kpi-card kpi-card-link");
+  kpiStore.title = "点击查看并管理备份文件";
+  kpiStore.onclick = () => {
+    archiveSource = "local";
+    switchTab("archives");
+  };
   kpiStore.append(
+    node("span", "本地备份占用", "kpi-label"),
     node("div", formatBytes(storage.total_size), "kpi-value"),
     node(
       "span",
@@ -319,7 +364,10 @@ function renderCards() {
     if (planErr) {
       addMeta("定时计划", planErr, true);
     } else if (enabled && model.next[key]) {
-      addMeta("定时计划", `${model.settings[`${key}_cron`]} · ${formatRelative(model.next[key], true)}`);
+      addMeta(
+        "定时计划",
+        `${model.settings[`${key}_cron`]} · ${formatRelative(model.next[key], true)}`,
+      );
     } else {
       addMeta("定时计划", "已关闭（仅手动）");
     }
@@ -349,7 +397,7 @@ function renderCards() {
 
     // Card Actions
     const actions = node("div", undefined, "card-actions");
-    const runBtn = node("button", `立即备份`, "btn btn-tonal");
+    const runBtn = node("button", "立即备份", "btn btn-tonal");
     runBtn.type = "button";
     runBtn.disabled = isRunning;
     runBtn.onclick = async () => {
@@ -396,10 +444,17 @@ function renderCards() {
       actions.append(testBtn);
     }
 
-    const cfgBtn = node("button", "配置", "btn btn-sm spacer");
+    const filesBtn = node("button", "文件", "btn btn-sm spacer");
+    filesBtn.type = "button";
+    filesBtn.onclick = () => {
+      archiveSource = key;
+      switchTab("archives");
+    };
+
+    const cfgBtn = node("button", "配置", "btn btn-sm");
     cfgBtn.type = "button";
     cfgBtn.onclick = () => openSettingsFor(key);
-    actions.append(cfgBtn);
+    actions.append(filesBtn, cfgBtn);
 
     card.append(actions);
     cards.push(card);
@@ -521,6 +576,249 @@ function renderHistory() {
   el("history").replaceChildren(...rows);
 }
 
+// Phase 2: Archives Tab
+function syncArchiveSourceButtons() {
+  for (const btn of document.querySelectorAll("[data-archive-source]")) {
+    btn.setAttribute(
+      "aria-pressed",
+      String(btn.dataset.archiveSource === archiveSource),
+    );
+  }
+  el("archives-tip").textContent =
+    archiveSource === "local"
+      ? "本地 ZIP 保存在 data/backups/，可直接下载保存，或在 AstrBot 原生备份列表中导入恢复。"
+      : "点击「拉取到本地」会将远端 ZIP 校验后保存到 data/backups/，随后可在 AstrBot 原生备份列表中一键恢复。";
+}
+
+function renderArchives() {
+  syncArchiveSourceButtons();
+  const container = el("archives-list");
+  const summary = el("archives-summary");
+
+  if (archiveLoading) {
+    summary.textContent = "加载中…";
+    container.replaceChildren(
+      node(
+        "p",
+        archiveSource === "local"
+          ? "正在扫描本地备份目录…"
+          : "正在连接 WebDAV 读取远端目录…",
+        "empty",
+      ),
+    );
+    return;
+  }
+
+  const state = archivesCache[archiveSource];
+  if (!state) {
+    summary.textContent = "";
+    container.replaceChildren(node("p", "暂无数据，点击刷新列表。", "empty"));
+    return;
+  }
+
+  if (state.error) {
+    summary.textContent = "读取失败";
+    const box = node("div", undefined, "empty-state");
+    box.append(node("div", state.error, "callout callout-err"));
+    if (archiveSource === "webdav" && !model?.settings?.url) {
+      const goBtn = node("button", "前往配置 WebDAV", "btn btn-primary btn-sm");
+      goBtn.type = "button";
+      goBtn.onclick = () => openSettingsFor("webdav");
+      box.append(goBtn);
+    }
+    container.replaceChildren(box);
+    return;
+  }
+
+  const items = state.items || [];
+  summary.textContent = `共 ${items.length} 份 · ${formatBytes(state.total_size || 0)}`;
+
+  if (!items.length) {
+    container.replaceChildren(
+      node(
+        "p",
+        archiveSource === "local"
+          ? "data/backups/ 中暂无 ZIP 备份文件。"
+          : "WebDAV 远端目录中暂无 ZIP 备份文件。",
+        "empty",
+      ),
+    );
+    return;
+  }
+
+  const rows = items.map((item) => {
+    const row = node("div", undefined, "archive-row");
+    const main = node("div", undefined, "archive-main");
+
+    const head = node("div", undefined, "archive-head");
+    head.append(node("code", item.name, "run-path"));
+    head.append(
+      node(
+        "span",
+        item.owned ? "本插件" : archiveSource === "local" ? "其他/原生" : "其他",
+        item.owned ? "tag tag-accent" : "tag",
+      ),
+    );
+    if (archiveSource === "webdav" && item.exists_local) {
+      head.append(node("span", "本地已有", "tag tag-ok"));
+    }
+    main.append(head);
+
+    const subParts = [formatBytes(item.size)];
+    if (item.modified) {
+      subParts.push(
+        `${formatTime(item.modified)}（${formatRelative(item.modified, false)}）`,
+      );
+    }
+    main.append(node("div", subParts.join(" · "), "archive-sub"));
+
+    const actions = node("div", undefined, "archive-actions");
+    const deleteKey = `${archiveSource}:${item.name}`;
+
+    if (archiveSource === "local") {
+      const dlBtn = node("button", "下载", "btn btn-tonal btn-sm");
+      dlBtn.type = "button";
+      dlBtn.onclick = async () => {
+        dlBtn.disabled = true;
+        dlBtn.textContent = "下载中…";
+        try {
+          await bridge.download(
+            "archives/local/download",
+            { name: item.name },
+            item.name,
+          );
+          showToast(`已开始下载 ${item.name}`, "success");
+        } catch (err) {
+          showToast(`下载失败：${err.message || "请重试"}`, "error");
+        } finally {
+          dlBtn.disabled = false;
+          dlBtn.textContent = "下载";
+        }
+      };
+      actions.append(dlBtn);
+    } else {
+      const pullBtn = node(
+        "button",
+        item.exists_local ? "已在本地" : "拉取到本地",
+        "btn btn-tonal btn-sm",
+      );
+      pullBtn.type = "button";
+      pullBtn.disabled = Boolean(item.exists_local);
+      pullBtn.onclick = async () => {
+        pullBtn.disabled = true;
+        pullBtn.textContent = "拉取中…";
+        showToast(`正在从 WebDAV 拉取 ${item.name}…`, "pending");
+        try {
+          const res = await bridge.apiPost("archives/webdav/pull", {
+            name: item.name,
+          });
+          showToast(
+            `已拉取到本地（${formatBytes(res?.size)}），可在原生备份列表中恢复。`,
+            "success",
+          );
+          archivesCache.local = null;
+          await Promise.all([
+            refresh().catch(() => {}),
+            loadArchives("webdav", { silent: true }),
+          ]);
+        } catch (err) {
+          showToast(`拉取失败：${err.message || "请稍后重试"}`, "error");
+          pullBtn.disabled = false;
+          pullBtn.textContent = "拉取到本地";
+        }
+      };
+      actions.append(pullBtn);
+    }
+
+    // Inline two-step delete confirmation (sandbox iframe has no allow-modals)
+    if (confirmDeleteKey === deleteKey) {
+      const confirmBtn = node("button", "确认删除", "btn btn-danger-solid btn-sm");
+      confirmBtn.type = "button";
+      confirmBtn.onclick = async () => {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "删除中…";
+        const endpoint =
+          archiveSource === "local"
+            ? "archives/local/delete"
+            : "archives/webdav/delete";
+        try {
+          await bridge.apiPost(endpoint, { name: item.name });
+          confirmDeleteKey = null;
+          showToast(`已删除 ${item.name}`, "success");
+          if (archiveSource === "local") {
+            archivesCache.webdav = null;
+          }
+          await Promise.all([
+            refresh().catch(() => {}),
+            loadArchives(archiveSource, { silent: true }),
+          ]);
+        } catch (err) {
+          showToast(`删除失败：${err.message || "请稍后重试"}`, "error");
+          confirmDeleteKey = null;
+          renderArchives();
+        }
+      };
+      const cancelBtn = node("button", "取消", "btn btn-sm");
+      cancelBtn.type = "button";
+      cancelBtn.onclick = () => {
+        confirmDeleteKey = null;
+        renderArchives();
+      };
+      actions.append(confirmBtn, cancelBtn);
+    } else {
+      const delBtn = node("button", "删除", "btn btn-danger btn-sm");
+      delBtn.type = "button";
+      delBtn.onclick = () => {
+        confirmDeleteKey = deleteKey;
+        renderArchives();
+      };
+      actions.append(delBtn);
+    }
+
+    row.append(main, actions);
+    return row;
+  });
+
+  container.replaceChildren(...rows);
+}
+
+async function loadArchives(source = archiveSource, { silent = false } = {}) {
+  confirmDeleteKey = null;
+  archiveLoading = true;
+  el("refresh-archives-btn").disabled = true;
+  renderArchives();
+  try {
+    const endpoint =
+      source === "local" ? "archives/local" : "archives/webdav";
+    const data = await bridge.apiGet(endpoint);
+    archivesCache[source] = {
+      items: data?.items || [],
+      total_size: data?.total_size || 0,
+      collection: data?.collection || "",
+      error: null,
+    };
+    if (source === "local") {
+      el("archives-count").textContent = String(archivesCache.local.items.length);
+    }
+  } catch (err) {
+    archivesCache[source] = {
+      items: [],
+      total_size: 0,
+      error: err.message || "读取备份列表失败",
+    };
+    if (!silent) {
+      showToast(archivesCache[source].error, "error");
+    }
+  } finally {
+    archiveLoading = false;
+    el("refresh-archives-btn").disabled = false;
+    if (source === archiveSource) {
+      renderArchives();
+    }
+  }
+}
+
+// Settings helpers
 function updateDirtyIndicators() {
   const anyDirty = Boolean(drafts.local || drafts.webdav);
   el("settings-dirty-dot").hidden = !anyDirty;
@@ -632,14 +930,23 @@ function drawForm() {
 
 function switchTab(nextTab) {
   activeTab = nextTab;
+  confirmDeleteKey = null;
   for (const btn of document.querySelectorAll("[data-tab]")) {
     const selected = btn.dataset.tab === nextTab;
     btn.setAttribute("aria-selected", String(selected));
   }
   el("tab-history").hidden = nextTab !== "history";
+  el("tab-archives").hidden = nextTab !== "archives";
   el("tab-settings").hidden = nextTab !== "settings";
   if (nextTab === "settings") {
     drawForm();
+  } else if (nextTab === "archives") {
+    syncArchiveSourceButtons();
+    if (!archivesCache[archiveSource]) {
+      loadArchives(archiveSource, { silent: true });
+    } else {
+      renderArchives();
+    }
   }
 }
 
@@ -672,10 +979,19 @@ function scheduleNextPoll() {
 async function refresh() {
   if (loading) return;
   loading = true;
+  const prevHistoryTop = model?.history?.[0]?.time;
   try {
     model = await bridge.apiGet("dashboard");
     lastSyncAt = new Date();
     renderAll();
+    // Invalidate cached archive lists when a new backup completes
+    if (prevHistoryTop && model.history?.[0]?.time !== prevHistoryTop) {
+      archivesCache.local = null;
+      archivesCache.webdav = null;
+      if (activeTab === "archives") {
+        loadArchives(archiveSource, { silent: true });
+      }
+    }
   } finally {
     loading = false;
   }
@@ -686,6 +1002,9 @@ el("refresh-btn").onclick = async () => {
   el("refresh-btn").disabled = true;
   try {
     await refresh();
+    if (activeTab === "archives") {
+      await loadArchives(archiveSource, { silent: true });
+    }
     showToast("状态已刷新", "info");
   } catch (err) {
     showToast(err.message || "刷新失败", "error");
@@ -699,6 +1018,23 @@ el("open-settings-btn").onclick = () => openSettingsFor(mode);
 for (const btn of document.querySelectorAll("[data-tab]")) {
   btn.onclick = () => switchTab(btn.dataset.tab);
 }
+
+for (const btn of document.querySelectorAll("[data-archive-source]")) {
+  btn.onclick = () => {
+    const nextSource = btn.dataset.archiveSource;
+    if (nextSource === archiveSource && archivesCache[nextSource]) return;
+    archiveSource = nextSource;
+    confirmDeleteKey = null;
+    syncArchiveSourceButtons();
+    if (!archivesCache[archiveSource]) {
+      loadArchives(archiveSource, { silent: true });
+    } else {
+      renderArchives();
+    }
+  };
+}
+
+el("refresh-archives-btn").onclick = () => loadArchives(archiveSource);
 
 for (const btn of document.querySelectorAll("[data-filter-mode]")) {
   btn.onclick = () => {
@@ -787,7 +1123,10 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
     el("url").focus();
     return;
   }
-  if (!testing && (values[`${mode}_keep_count`] < 0 || values[`${mode}_keep_count`] > 1000)) {
+  if (
+    !testing &&
+    (values[`${mode}_keep_count`] < 0 || values[`${mode}_keep_count`] > 1000)
+  ) {
     showToast("保留份数需填写 0 到 1000 之间的整数。", "error");
     el("keep-count").focus();
     return;
@@ -831,6 +1170,9 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
     );
     if (values.password) model.password_set = true;
     delete drafts[mode];
+    if (mode === "webdav") {
+      archivesCache.webdav = null;
+    }
     drawForm();
     showToast(`${NAMES[mode]}设置已保存`, "success");
   } catch (err) {
@@ -862,21 +1204,36 @@ const tickTimer = setInterval(() => {
   for (const nodeEl of document.querySelectorAll(".elapsed-timer")) {
     const iso = nodeEl.dataset.started;
     if (iso) {
-      const sec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+      const sec = Math.max(
+        0,
+        Math.floor((Date.now() - new Date(iso).getTime()) / 1000),
+      );
       nodeEl.textContent = `已运行 ${sec}s`;
     }
   }
 }, 1000);
 
 // Boot
+applyHostTheme(null);
+const onSystemThemeChange = () => {
+  if (typeof bridge?.getContext?.()?.isDark !== "boolean") {
+    applyHostTheme(null);
+  }
+};
+systemDarkQuery.addEventListener("change", onSystemThemeChange);
+
 try {
   if (!bridge) throw new Error("请从 AstrBot WebUI 的插件页面打开仪表盘。");
-  await bridge.ready();
+  const initialContext = await bridge.ready();
+  applyHostTheme(initialContext);
+  const offContext = bridge.onContext(applyHostTheme);
   await refresh();
   scheduleNextPoll();
   window.addEventListener(
     "pagehide",
     () => {
+      offContext();
+      systemDarkQuery.removeEventListener("change", onSystemThemeChange);
       clearTimeout(pollTimer);
       clearInterval(tickTimer);
     },
