@@ -81,5 +81,19 @@
     "type": "bool",
     "description": "允许在可信内网上使用明文 HTTP",
     "default": false
+  },
+  "notify_mode": {
+    "type": "string",
+    "description": "备份通知时机",
+    "default": "off",
+    "options": ["off", "all", "failure"],
+    "labels": ["关闭", "成功 & 失败", "仅失败"],
+    "hint": "控制备份任务结束后何时主动发送通知消息。"
+  },
+  "notify_targets": {
+    "type": "list",
+    "description": "通知目标会话列表",
+    "default": [],
+    "hint": "标准 unified_msg_origin 列表（如 aiocqhttp:GroupMessage:123456789），可在仪表盘可视化添加或在目标会话发送 /backup_notify add 绑定。"
   }
 }

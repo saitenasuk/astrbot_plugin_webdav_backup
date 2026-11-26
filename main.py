@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import tempfile
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from apscheduler.triggers.cron import CronTrigger
 from yarl import URL
 
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.web import (
     error_response,
@@ -37,7 +39,11 @@ from .webdav import (
 
 SCHEMA = json.loads(Path(__file__).with_name("_conf_schema.json").read_text("utf-8"))
 MODES = ("local", "webdav")
+NOTIFY_MODES = ("off", "all", "failure")
+NOTIFY_MODE_LABELS = {"off": "关闭", "all": "成功 & 失败", "failure": "仅失败"}
 MAX_KEEP_COUNT = 1000
+MAX_NOTIFY_TARGETS = 50
+UMO_PATTERN = re.compile(r"^[^\s:]+:(?:GroupMessage|FriendMessage):[^\s:]+$")
 BACKUP_NAME_PATTERNS = {
     mode: re.compile(rf"^astrbot_backup_\d{{8}}_\d{{6}}_{mode}_[0-9a-f]{{12}}\.zip$")
     for mode in MODES
@@ -69,9 +75,11 @@ class BackupDashboard(Star):
         for endpoint, method, handler in [
             ("dashboard", "GET", self.dashboard),
             ("events", "GET", self.events),
+            ("temp-size", "GET", self.temp_size),
             ("settings", "POST", self.settings),
             ("cron-preview", "POST", self.cron_preview),
             ("test-connection", "POST", self.test_connection),
+            ("notify-test", "POST", self.test_notification),
             ("run", "POST", self.run_now),
             ("archives/local", "GET", self.list_local_archives),
             ("archives/local/download", "GET", self.download_local_archive),
@@ -158,10 +166,27 @@ class BackupDashboard(Star):
                         plugin_size += size
             except OSError:
                 logger.warning("Could not inspect local backup directory")
+        platforms = []
+        manager = getattr(self.context, "platform_manager", None)
+        for inst in getattr(manager, "platform_insts", []) or []:
+            meta = inst.meta()
+            pid = getattr(meta, "id", "") or ""
+            pname = getattr(meta, "name", "") or ""
+            if not pid or pname == "webchat":
+                continue
+            platforms.append(
+                {
+                    "id": pid,
+                    "name": pname,
+                    "unsupported": pname
+                    in ("qq_official", "qq_official_webhook", "weixin_official_account"),
+                }
+            )
         return json_response(
             {
                 "settings": public,
                 "password_set": bool(self.config.get("password")),
+                "platforms": platforms,
                 "phases": self.phases,
                 "phase_started": self.phase_started,
                 "progress": self.progress,
@@ -257,6 +282,49 @@ class BackupDashboard(Star):
             },
         )
 
+    async def temp_size(self):
+        """Measure the current size and file count of AstrBot's data/temp directory.
+
+        Uses the same traversal exclusions as archive creation so the estimate
+        reflects what would actually be included when backing up ``temp``.
+
+        Returns:
+            A JSON response containing ``exists``, ``size``, and ``files``.
+        """
+        temp_dir = Path(get_astrbot_data_path()) / "temp"
+
+        def _scan() -> dict:
+            if temp_dir.is_symlink() or not temp_dir.is_dir():
+                return {"exists": False, "size": 0, "files": 0}
+            total_size = 0
+            total_files = 0
+            for folder, dirs, files in os.walk(temp_dir):
+                parent = Path(folder)
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if d not in (".git", "__pycache__")
+                    and not (parent / d).is_symlink()
+                ]
+                for file in files:
+                    if file.endswith(".pyc"):
+                        continue
+                    path = parent / file
+                    if path.is_symlink() or not path.is_file():
+                        continue
+                    try:
+                        total_size += path.stat().st_size
+                        total_files += 1
+                    except OSError:
+                        continue
+            return {"exists": True, "size": total_size, "files": total_files}
+
+        try:
+            result = await asyncio.to_thread(_scan)
+        except OSError:
+            return error_response("无法读取 data/temp 目录", status_code=500)
+        return json_response(result)
+
     async def settings(self):
         """Validate and persist updated plugin backup settings.
 
@@ -273,7 +341,7 @@ class BackupDashboard(Star):
         candidate = {
             key: self.config.get(key, spec["default"]) for key, spec in SCHEMA.items()
         }
-        type_map = {"bool": bool, "string": str, "int": int}
+        type_map = {"bool": bool, "string": str, "int": int, "list": list}
         try:
             for key, value in payload.items():
                 spec = SCHEMA[key]
@@ -283,6 +351,10 @@ class BackupDashboard(Star):
                     raise ValueError(f"设置值过长 {key}")
                 if spec["type"] == "int" and not (0 <= value <= MAX_KEEP_COUNT):
                     raise ValueError(f"保留份数需在 0 到 {MAX_KEEP_COUNT} 之间")
+                if key == "notify_mode" and value not in NOTIFY_MODES:
+                    raise ValueError("通知时机选项无效")
+                if key == "notify_targets":
+                    value = self._validate_notify_targets(value)
                 candidate[key] = value
             for mode in MODES:
                 try:
@@ -338,6 +410,237 @@ class BackupDashboard(Star):
             prev = fire
             cursor = fire
         return json_response({"next_runs": runs})
+
+    @staticmethod
+    def _validate_notify_targets(raw: object) -> list[str]:
+        """Validate and deduplicate a list of unified_msg_origin targets.
+
+        Args:
+            raw: Candidate list of unified_msg_origin strings.
+
+        Returns:
+            Deduplicated list of validated unified_msg_origin strings.
+
+        Raises:
+            ValueError: If any entry is malformed or the list exceeds limits.
+        """
+        if not isinstance(raw, list):
+            raise ValueError("通知目标必须是列表")
+        if len(raw) > MAX_NOTIFY_TARGETS:
+            raise ValueError(f"通知目标数量不能超过 {MAX_NOTIFY_TARGETS} 个")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, str):
+                raise ValueError("通知目标格式无效")
+            umo = item.strip()
+            if (
+                not umo
+                or len(umo) > 256
+                or any(ord(ch) < 32 for ch in umo)
+                or not UMO_PATTERN.fullmatch(umo)
+            ):
+                raise ValueError(
+                    f"通知目标格式无效：{umo or '(空)'}（应为 平台ID:GroupMessage/FriendMessage:会话ID）"
+                )
+            if umo not in seen:
+                seen.add(umo)
+                cleaned.append(umo)
+        return cleaned
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        """Format a byte count into a concise human-readable string.
+
+        Args:
+            size: File size in bytes.
+
+        Returns:
+            Formatted size string.
+        """
+        if size < 1024:
+            return f"{size} B"
+        if size < 1048576:
+            return f"{size / 1024:.1f} KiB"
+        if size < 1073741824:
+            return f"{size / 1048576:.1f} MiB"
+        return f"{size / 1073741824:.2f} GiB"
+
+    async def _send_backup_notification(self, record: dict) -> None:
+        """Send a backup result notification to configured sessions when enabled.
+
+        Args:
+            record: Completed backup run record dictionary.
+        """
+        notify_mode = self.config.get("notify_mode", "off")
+        if notify_mode == "off":
+            return
+        if notify_mode == "failure" and record.get("ok"):
+            return
+        raw_targets = self.config.get("notify_targets") or []
+        if not isinstance(raw_targets, list) or not raw_targets:
+            return
+
+        dest_label = "本地" if record.get("mode") == "local" else "WebDAV"
+        trigger_label = "定时" if record.get("trigger") == "schedule" else "手动"
+        duration_ms = record.get("duration_ms")
+        dur_text = (
+            f"{duration_ms / 1000:.1f} s"
+            if isinstance(duration_ms, int) and duration_ms >= 0
+            else ""
+        )
+        if record.get("ok"):
+            size_text = self._format_size(int(record.get("size") or 0))
+            lines = [
+                f"[AstrBot 备份] {dest_label}{trigger_label}备份成功",
+                f"归档大小：{size_text}" + (f" ｜ 耗时：{dur_text}" if dur_text else ""),
+            ]
+            if record.get("pruned"):
+                lines.append(f"已自动清理 {record['pruned']} 份旧备份")
+            if record.get("prune_error"):
+                lines.append("警告：旧备份自动清理失败，请前往仪表盘查看详情")
+        else:
+            lines = [
+                f"[AstrBot 备份] {dest_label}{trigger_label}备份失败",
+                f"原因：{record.get('error') or '未知错误'}",
+                "请前往 AstrBot 备份仪表盘排查。",
+            ]
+        text = "\n".join(lines)
+
+        for target in raw_targets:
+            if not isinstance(target, str) or not target.strip():
+                continue
+            try:
+                matched = await self.context.send_message(
+                    target.strip(), MessageChain().message(text)
+                )
+                if not matched:
+                    logger.warning(
+                        "Backup notification target platform not found: %s", target
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to send backup notification to %s: %s",
+                    target,
+                    exc,
+                )
+
+    async def test_notification(self):
+        """Send a test notification message to the submitted or saved target sessions.
+
+        Returns:
+            A JSON response summarizing delivery counts, or an error response.
+        """
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("参数无效", status_code=400)
+        raw_targets = (
+            payload["targets"]
+            if "targets" in payload
+            else self.config.get("notify_targets", [])
+        )
+        try:
+            targets = self._validate_notify_targets(raw_targets)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        if not targets:
+            return error_response("请先添加至少一个通知目标会话", status_code=400)
+
+        sent = 0
+        failed: list[str] = []
+        message = "[AstrBot 备份] 这是一条测试通知，说明当前会话可以正常接收备份结果推送。"
+        for target in targets:
+            try:
+                matched = await self.context.send_message(
+                    target, MessageChain().message(message)
+                )
+                if matched:
+                    sent += 1
+                else:
+                    failed.append(f"{target}（未找到对应运行中的消息平台）")
+            except Exception as exc:
+                failed.append(f"{target}（{type(exc).__name__}: {exc}）")
+
+        if sent == 0:
+            return error_response(
+                "测试通知发送失败：" + "；".join(failed), status_code=502
+            )
+        return json_response({"sent": sent, "failed": failed})
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("backup_notify")
+    async def cmd_backup_notify(self, event: AstrMessageEvent, action: str = "", value: str = ""):
+        """Bind or manage backup notifications for the current chat session.
+
+        Args:
+            event: Incoming AstrBot message event.
+            action: Subcommand (``add``, ``del``, ``list``, or ``mode``).
+            value: Mode value when ``action`` is ``mode``.
+        """
+        action = action.strip().lower()
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        targets = list(self.config.get("notify_targets") or [])
+        cur_mode = self.config.get("notify_mode", "off")
+
+        if action == "add":
+            if not umo or not UMO_PATTERN.fullmatch(umo):
+                yield event.plain_result("当前会话不支持绑定备份通知。")
+                return
+            if umo in targets:
+                yield event.plain_result(
+                    f"当前会话已在通知列表中（通知时机：{NOTIFY_MODE_LABELS.get(cur_mode, cur_mode)}）。"
+                )
+                return
+            if len(targets) >= MAX_NOTIFY_TARGETS:
+                yield event.plain_result(f"通知目标数量已达上限（{MAX_NOTIFY_TARGETS}）。")
+                return
+            targets.append(umo)
+            self.config.save_config({"notify_targets": targets})
+            tip = (
+                " 当前通知时机为「关闭」，可发送 /backup_notify mode failure 或在仪表盘开启。"
+                if cur_mode == "off"
+                else ""
+            )
+            yield event.plain_result(f"已将当前会话加入备份通知列表：{umo}{tip}")
+            return
+
+        if action in ("del", "remove"):
+            if umo not in targets:
+                yield event.plain_result("当前会话不在备份通知列表中。")
+                return
+            targets = [item for item in targets if item != umo]
+            self.config.save_config({"notify_targets": targets})
+            yield event.plain_result(f"已将当前会话移出备份通知列表：{umo}")
+            return
+
+        if action == "mode":
+            next_mode = value.strip().lower()
+            if next_mode not in NOTIFY_MODES:
+                yield event.plain_result(
+                    "无效的通知时机。用法：/backup_notify mode off|all|failure"
+                )
+                return
+            self.config.save_config({"notify_mode": next_mode})
+            yield event.plain_result(
+                f"备份通知时机已设置为：{NOTIFY_MODE_LABELS[next_mode]}"
+            )
+            return
+
+        if action == "list":
+            bound = "已绑定" if umo in targets else "未绑定"
+            yield event.plain_result(
+                f"备份通知时机：{NOTIFY_MODE_LABELS.get(cur_mode, cur_mode)}\n"
+                f"已绑定目标数：{len(targets)}（当前会话：{bound}）"
+            )
+            return
+
+        yield event.plain_result(
+            "备份通知管理指令（仅管理员）：\n"
+            "/backup_notify add — 绑定当前群/私聊接收通知\n"
+            "/backup_notify del — 移除当前群/私聊\n"
+            "/backup_notify list — 查看当前通知状态\n"
+            "/backup_notify mode off|all|failure — 设置通知时机"
+        )
 
     async def test_connection(self):
         """Exercise a transfer using the current dashboard inputs without saving them.
@@ -854,6 +1157,7 @@ class BackupDashboard(Star):
                 except OSError:
                     logger.warning("Could not persist backup history")
                 self._broadcast("completed", {"mode": mode, "record": record})
+                await self._send_backup_notification(record)
 
     async def terminate(self):
         self.closing = True

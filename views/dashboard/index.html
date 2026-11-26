@@ -194,14 +194,18 @@
                 WebDAV 备份
                 <span class="dirty-dot" data-dirty="webdav" hidden></span>
               </button>
+              <button type="button" data-mode="notify" aria-pressed="false">
+                消息通知
+                <span class="dirty-dot" data-dirty="notify" hidden></span>
+              </button>
             </div>
-            <p class="settings-tip">
+            <p id="settings-tip" class="settings-tip">
               两个目标独立配置定时计划、保留份数与备份范围。
             </p>
           </div>
 
           <form id="form">
-            <fieldset class="form-section">
+            <fieldset id="plan-section" class="form-section">
               <legend id="plan-title">本地定时计划</legend>
               <label class="check-row">
                 <input type="checkbox" id="enabled" />
@@ -243,7 +247,7 @@
               <div id="cron-preview" class="preview-box" aria-live="polite"></div>
             </fieldset>
 
-            <fieldset class="form-section">
+            <fieldset id="retention-section" class="form-section">
               <legend>自动保留策略</legend>
               <div class="presets-row" aria-label="保留份数预设">
                 <span class="presets-label">快捷份数：</span>
@@ -312,7 +316,7 @@
               </label>
             </fieldset>
 
-            <fieldset class="form-section">
+            <fieldset id="scope-section" class="form-section">
               <legend>备份内容</legend>
               <p class="baseline">
                 常规备份包含主数据库、配置、知识库、附件、插件及其数据、技能、WebChat 数据和文生图模板。
@@ -323,8 +327,20 @@
                   id="include-temp"
                   aria-describedby="temp-hint"
                 />
-                <div>
-                  <label for="include-temp"><strong>备份 temp 目录</strong></label>
+                <div class="check-card-body">
+                  <div class="check-card-head">
+                    <label for="include-temp"><strong>备份 temp 目录</strong></label>
+                    <div class="temp-size-bar">
+                      <span id="temp-size-result" class="temp-size-meta" hidden></span>
+                      <button
+                        id="check-temp-size"
+                        type="button"
+                        class="btn btn-sm"
+                      >
+                        查看当前大小
+                      </button>
+                    </div>
+                  </div>
                   <small id="temp-hint">
                     data/temp 包含运行缓存、临时图片、语音和下载文件，体积可能较大。
                   </small>
@@ -332,11 +348,63 @@
               </div>
             </fieldset>
 
+            <fieldset id="notify-mode-section" class="form-section" hidden>
+              <legend>通知时机</legend>
+              <label>
+                何时主动发送备份结果通知
+                <select id="notify-mode">
+                  <option value="off">关闭</option>
+                  <option value="all">成功 &amp; 失败</option>
+                  <option value="failure">仅失败</option>
+                </select>
+              </label>
+              <small>
+                本地与 WebDAV 备份共用此通知设置。消息内容已脱敏，不会暴露完整 WebDAV 地址或凭据。
+              </small>
+            </fieldset>
+
+            <fieldset id="notify-targets-section" class="form-section" hidden>
+              <legend>通知目标会话</legend>
+              <div class="notify-builder">
+                <select id="notify-platform" aria-label="消息平台"></select>
+                <input
+                  type="text"
+                  id="notify-platform-custom"
+                  placeholder="平台实例 ID（如 aiocqhttp）"
+                  hidden
+                />
+                <select id="notify-chat-type" aria-label="会话类型">
+                  <option value="GroupMessage">群聊</option>
+                  <option value="FriendMessage">私聊</option>
+                </select>
+                <input
+                  type="text"
+                  id="notify-session-id"
+                  placeholder="输入群号 / 用户 ID（或直接粘贴完整 UMO）"
+                />
+                <button
+                  id="add-notify-target"
+                  type="button"
+                  class="btn btn-tonal"
+                >
+                  添加
+                </button>
+              </div>
+              <small>
+                自动生成标准 unified_msg_origin；管理员也可直接在目标群或私聊发送
+                <code>/backup_notify add</code> 一键绑定。
+              </small>
+              <div id="notify-targets-list" class="notify-list"></div>
+            </fieldset>
+
             <div class="footer">
               <span id="save-feedback" role="status" aria-atomic="true"></span>
               <div class="actions">
                 <button id="discard-draft" type="button" class="btn" hidden>
                   放弃更改
+                </button>
+                <button id="test-notify" type="button" class="btn" hidden>
+                  发送测试通知
                 </button>
                 <button id="test-connection" type="button" class="btn" hidden>
                   测试连接

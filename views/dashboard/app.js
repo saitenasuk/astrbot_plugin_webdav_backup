@@ -345,6 +345,8 @@ function updateCardProgressInPlace(targetMode) {
   if (!box || phase === "空闲") return false;
   const pill = document.querySelector(`[data-card-pill="${targetMode}"]`);
   if (pill) pill.textContent = phase;
+  const headline = document.querySelector(`[data-card-headline="${targetMode}"]`);
+  if (headline) headline.textContent = `${phase}…`;
   fillProgressBox(
     box,
     phase,
@@ -365,10 +367,11 @@ function renderCards() {
     const enabled = Boolean(model.settings[`${key}_enabled`]);
     const keepCount = Number(model.settings[`${key}_keep_count`] || 0);
     const includeTemp = Boolean(model.settings[`${key}_items`]);
+    const unconfigured = key === "webdav" && !model.settings.url;
 
     const card = node("article", undefined, "card");
 
-    // Header
+    // Header: pill shows current operational state (not duplicating outcome text)
     const head = node("div", undefined, "card-head");
     const titleWrap = node("div", undefined, "card-title");
     titleWrap.append(node("h2", `${label}备份`));
@@ -376,45 +379,62 @@ function renderCards() {
       ? "pill pill-info pill-pulse"
       : planErr
         ? "pill pill-err"
-        : last && !last.ok
-          ? "pill pill-err"
-          : last && last.ok
-            ? "pill pill-ok"
-            : "pill pill-neutral";
+        : unconfigured
+          ? "pill pill-warn"
+          : last && !last.ok
+            ? "pill pill-err"
+            : last && last.ok
+              ? "pill pill-ok"
+              : "pill pill-neutral";
     const pillText = isRunning
       ? phase
       : planErr
         ? "计划无效"
-        : last
-          ? last.ok
-            ? "上次成功"
-            : "上次失败"
-          : "空闲";
+        : unconfigured
+          ? "未配置"
+          : last && !last.ok
+            ? "最近异常"
+            : "空闲";
     const pillEl = node("span", pillText, pillClass);
     pillEl.dataset.cardPill = key;
     head.append(titleWrap, pillEl);
     card.append(head);
 
-    // Metric Row
+    // Primary status summary (consistent semantic slot across all states)
     const metricRow = node("div", undefined, "card-metric-row");
-    const metricText = last
-      ? last.ok
-        ? formatBytes(last.size)
-        : "备份失败"
-      : "尚未运行";
-    const metricCls = last
-      ? last.ok
-        ? "metric"
-        : "metric is-err"
-      : "metric is-muted";
-    metricRow.append(
-      node("div", metricText, metricCls),
-      node(
-        "span",
-        last ? `最近运行 ${formatRelative(last.time, false)}` : "等待首次执行",
-        "metric-time",
-      ),
-    );
+    let headlineText = "尚未运行";
+    let headlineCls = "metric is-muted";
+    let subText = unconfigured
+      ? "请先配置 WebDAV 服务地址与账号"
+      : "点击下方「立即备份」或开启定时计划";
+    let subCls = "metric-sub";
+
+    if (isRunning) {
+      headlineText = `${phase}…`;
+      headlineCls = "metric";
+      subText = "备份任务执行中，下方实时更新进度";
+    } else if (last) {
+      if (last.ok) {
+        const rel = formatRelative(last.time, false);
+        headlineText = rel === "刚刚" ? "刚刚已备份" : `${rel}已备份`;
+        headlineCls = "metric";
+        const parts = [`单次归档 ${formatBytes(last.size)}`];
+        if (Number.isFinite(last.duration_ms)) {
+          parts.push(`耗时 ${formatDuration(last.duration_ms)}`);
+        }
+        parts.push(formatTime(last.time));
+        subText = parts.join(" · ");
+      } else {
+        headlineText = "最近备份失败";
+        headlineCls = "metric is-err";
+        subText = `${formatRelative(last.time, false)} · ${last.error || "请查看运行历史"}`;
+        subCls = "metric-sub is-err";
+      }
+    }
+
+    const headlineEl = node("div", headlineText, headlineCls);
+    headlineEl.dataset.cardHeadline = key;
+    metricRow.append(headlineEl, node("span", subText, subCls));
     card.append(metricRow);
 
     // Live progress indicator when active
@@ -908,18 +928,103 @@ async function loadArchives(source = archiveSource, { silent = false } = {}) {
 }
 
 // Settings helpers
+const UMO_RE = /^[^\s:]+:(?:GroupMessage|FriendMessage):[^\s:]+$/;
+
+function getNotifyTargetsWorkingCopy() {
+  const src = drafts.notify?.notify_targets ?? model?.settings?.notify_targets;
+  return Array.isArray(src) ? [...src] : [];
+}
+
+function populateNotifyPlatforms() {
+  const select = el("notify-platform");
+  const customInput = el("notify-platform-custom");
+  const prev = select.value;
+  const platforms = model?.platforms || [];
+  const options = [];
+  for (const p of platforms) {
+    const label = p.unsupported
+      ? `${p.id}（${p.name} · 不支持主动推送）`
+      : p.name && p.name !== p.id
+        ? `${p.id}（${p.name}）`
+        : p.id;
+    const opt = node("option", label);
+    opt.value = p.id;
+    options.push(opt);
+  }
+  const customOpt = node("option", "自定义平台 ID…");
+  customOpt.value = "__custom__";
+  options.push(customOpt);
+  select.replaceChildren(...options);
+
+  if (prev && options.some((o) => o.value === prev)) {
+    select.value = prev;
+  } else if (platforms.length > 0) {
+    const firstSupported = platforms.find((p) => !p.unsupported) || platforms[0];
+    select.value = firstSupported.id;
+  } else {
+    select.value = "__custom__";
+  }
+  customInput.hidden = select.value !== "__custom__";
+}
+
+function renderNotifyTargetsList() {
+  const container = el("notify-targets-list");
+  const list = getNotifyTargetsWorkingCopy();
+  if (!list.length) {
+    container.replaceChildren(
+      node(
+        "div",
+        "暂无通知目标。可在上方选择平台与群号/用户 ID 添加，或在群聊/私聊发送 /backup_notify add 绑定。",
+        "notify-empty",
+      ),
+    );
+    return;
+  }
+  const rows = list.map((umo) => {
+    const [platformId, chatType, sessionId] = umo.split(":");
+    const row = node("div", undefined, "notify-item");
+    const main = node("div", undefined, "notify-item-main");
+    main.append(
+      node("span", platformId, "tag tag-accent"),
+      node("span", chatType === "GroupMessage" ? "群聊" : "私聊", "tag"),
+      node("strong", sessionId),
+      node("code", umo, "run-path"),
+    );
+    const removeBtn = node("button", "移除", "btn btn-danger btn-sm");
+    removeBtn.type = "button";
+    removeBtn.onclick = () => {
+      const nextTargets = getNotifyTargetsWorkingCopy().filter((x) => x !== umo);
+      drafts.notify = {
+        notify_mode: el("notify-mode").value,
+        notify_targets: nextTargets,
+      };
+      renderNotifyTargetsList();
+      updateDirtyIndicators();
+    };
+    row.append(main, removeBtn);
+    return row;
+  });
+  container.replaceChildren(...rows);
+}
+
 function updateDirtyIndicators() {
-  const anyDirty = Boolean(drafts.local || drafts.webdav);
+  const anyDirty = Boolean(drafts.local || drafts.webdav || drafts.notify);
   el("settings-dirty-dot").hidden = !anyDirty;
-  for (const m of ["local", "webdav"]) {
+  for (const m of ["local", "webdav", "notify"]) {
     const dot = document.querySelector(`[data-dirty="${m}"]`);
     if (dot) dot.hidden = !drafts[m];
   }
   el("discard-draft").hidden = !drafts[mode];
-  el("save-feedback").textContent = drafts[mode] ? "当前目标有未保存的更改" : "";
+  el("save-feedback").textContent = drafts[mode] ? "当前页面有未保存的更改" : "";
 }
 
 function collect() {
+  if (mode === "notify") {
+    return {
+      notify_mode: el("notify-mode").value,
+      notify_targets: getNotifyTargetsWorkingCopy(),
+    };
+  }
   const values = {};
   for (const key of ["enabled", "cron", "timezone"]) {
     values[`${mode}_${key}`] =
@@ -985,10 +1090,40 @@ function syncPresetChips() {
 
 function drawForm() {
   if (!model) return;
+  const isNotify = mode === "notify";
   const conf = { ...model.settings, ...drafts[mode] };
   for (const b of document.querySelectorAll("[data-mode]")) {
     b.setAttribute("aria-pressed", String(b.dataset.mode === mode));
   }
+
+  el("plan-section").hidden = isNotify;
+  el("plan-section").disabled = isNotify;
+  el("retention-section").hidden = isNotify;
+  el("retention-section").disabled = isNotify;
+  el("scope-section").hidden = isNotify;
+  el("scope-section").disabled = isNotify;
+  el("remote").hidden = mode !== "webdav";
+  el("remote").disabled = mode !== "webdav";
+  el("notify-mode-section").hidden = !isNotify;
+  el("notify-mode-section").disabled = !isNotify;
+  el("notify-targets-section").hidden = !isNotify;
+  el("notify-targets-section").disabled = !isNotify;
+  el("test-connection").hidden = mode !== "webdav";
+  el("test-notify").hidden = !isNotify;
+
+  if (isNotify) {
+    el("settings-tip").textContent =
+      "配置备份结束后的主动消息通知，支持多平台群聊与私聊。";
+    el("save").textContent = "保存通知设置";
+    el("notify-mode").value = conf.notify_mode || "off";
+    populateNotifyPlatforms();
+    renderNotifyTargetsList();
+    updateDirtyIndicators();
+    return;
+  }
+
+  el("settings-tip").textContent =
+    "两个目标独立配置定时计划、保留份数与备份范围。";
   el("plan-title").textContent = `${NAMES[mode]}定时计划`;
   el("save").textContent = `保存${NAMES[mode]}设置`;
   el("enabled").checked = Boolean(conf[`${mode}_enabled`]);
@@ -1000,9 +1135,6 @@ function drawForm() {
       ? "每次本地备份完成后，仅保留由本插件生成的最新 N 份 ZIP，不影响手动上传或原生备份。填 0 表示不自动清理。"
       : "每次 WebDAV 备份校验成功后，自动清理远程目录中超出 N 份的本插件历史 ZIP（需服务器支持 PROPFIND 与 DELETE）。填 0 表示不自动清理。";
 
-  el("test-connection").hidden = mode !== "webdav";
-  el("remote").hidden = mode !== "webdav";
-  el("remote").disabled = mode !== "webdav";
   for (const key of ["url", "remote_dir", "username", "password"]) {
     el(key).value = conf[key] || "";
   }
@@ -1281,11 +1413,118 @@ for (const btn of document.querySelectorAll("[data-keep]")) {
 }
 
 el("form").oninput = (event) => {
+  if (
+    event.target === el("notify-platform") ||
+    event.target === el("notify-platform-custom") ||
+    event.target === el("notify-chat-type") ||
+    event.target === el("notify-session-id")
+  ) {
+    return;
+  }
   drafts[mode] = collect();
-  syncPresetChips();
+  if (mode !== "notify") {
+    syncPresetChips();
+  }
   updateDirtyIndicators();
   if (event.target === el("cron") || event.target === el("timezone")) {
     scheduleCronPreview();
+  }
+};
+
+el("notify-platform").onchange = () => {
+  el("notify-platform-custom").hidden =
+    el("notify-platform").value !== "__custom__";
+  if (!el("notify-platform-custom").hidden) {
+    el("notify-platform-custom").focus();
+  }
+};
+
+function addNotifyTargetFromInputs() {
+  const rawSession = el("notify-session-id").value.trim();
+  if (!rawSession) {
+    showToast("请填写群号、用户 ID 或完整 UMO。", "error");
+    el("notify-session-id").focus();
+    return;
+  }
+  let umo = rawSession;
+  if (!UMO_RE.test(rawSession)) {
+    const selectedPlatform = el("notify-platform").value;
+    const platformId =
+      selectedPlatform === "__custom__"
+        ? el("notify-platform-custom").value.trim()
+        : selectedPlatform;
+    if (!platformId || /[\s:]/.test(platformId)) {
+      showToast("请填写有效的平台实例 ID（不能包含空格或冒号）。", "error");
+      (selectedPlatform === "__custom__"
+        ? el("notify-platform-custom")
+        : el("notify-platform")
+      ).focus();
+      return;
+    }
+    if (/[\s:]/.test(rawSession)) {
+      showToast("群号或用户 ID 不能包含空格或冒号。", "error");
+      el("notify-session-id").focus();
+      return;
+    }
+    const chatType = el("notify-chat-type").value;
+    umo = `${platformId}:${chatType}:${rawSession}`;
+  }
+
+  const current = getNotifyTargetsWorkingCopy();
+  if (current.includes(umo)) {
+    showToast("该通知目标已在列表中。", "info");
+    return;
+  }
+  if (current.length >= 50) {
+    showToast("通知目标数量不能超过 50 个。", "error");
+    return;
+  }
+  drafts.notify = {
+    notify_mode: el("notify-mode").value,
+    notify_targets: [...current, umo],
+  };
+  el("notify-session-id").value = "";
+  renderNotifyTargetsList();
+  updateDirtyIndicators();
+  showToast(`已添加 ${umo}（记得点击保存通知设置）`, "info");
+}
+
+el("add-notify-target").onclick = addNotifyTargetFromInputs;
+el("notify-session-id").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addNotifyTargetFromInputs();
+  }
+});
+
+el("test-notify").onclick = async () => {
+  if (busy) return;
+  const targets = getNotifyTargetsWorkingCopy();
+  if (!targets.length) {
+    showToast("请先添加至少一个通知目标会话。", "error");
+    el("notify-session-id").focus();
+    return;
+  }
+  busy = true;
+  el("test-notify").disabled = true;
+  el("test-notify").textContent = "发送中…";
+  showToast(`正在向 ${targets.length} 个目标发送测试通知…`, "pending");
+  try {
+    const res = await bridge.apiPost("notify-test", { targets });
+    if (res?.failed?.length) {
+      showToast(
+        `已成功发送 ${res.sent} 个，失败 ${res.failed.length} 个：${res.failed.join("；")}`,
+        "error",
+      );
+    } else {
+      showToast(`测试通知已发送到 ${res?.sent ?? targets.length} 个目标会话。`, "success");
+    }
+  } catch (err) {
+    showToast(err.message || "测试通知发送失败", "error");
+  } finally {
+    busy = false;
+    el("test-notify").disabled = false;
+    el("test-notify").textContent = "发送测试通知";
   }
 };
 
@@ -1293,6 +1532,30 @@ el("discard-draft").onclick = () => {
   delete drafts[mode];
   drawForm();
   showToast("已恢复为上次保存的设置", "info");
+};
+
+el("check-temp-size").onclick = async () => {
+  const btn = el("check-temp-size");
+  const result = el("temp-size-result");
+  btn.disabled = true;
+  btn.textContent = "计算中…";
+  try {
+    const info = await bridge.apiGet("temp-size");
+    result.hidden = false;
+    if (!info?.exists) {
+      result.textContent = "目录不存在（0 B）";
+    } else if (!info.files) {
+      result.textContent = "当前为空（0 B）";
+    } else {
+      result.textContent = `当前 ${formatBytes(info.size)}（${info.files} 个文件）`;
+    }
+    btn.textContent = "重新计算";
+  } catch (err) {
+    showToast(`查询 temp 大小失败：${err.message || "请稍后重试"}`, "error");
+    btn.textContent = result.hidden ? "查看当前大小" : "重新计算";
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 el("form").addEventListener(
@@ -1318,6 +1581,7 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
   }
   if (
     !testing &&
+    mode !== "notify" &&
     (values[`${mode}_keep_count`] < 0 || values[`${mode}_keep_count`] > 1000)
   ) {
     showToast("保留份数需填写 0 到 1000 之间的整数。", "error");
@@ -1325,16 +1589,18 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
     return;
   }
 
+  const saveLabel = mode === "notify" ? "通知" : NAMES[mode];
   busy = true;
   el("save").disabled = true;
   el("test-connection").disabled = true;
+  el("test-notify").disabled = true;
   el("discard-draft").disabled = true;
   if (testing) {
     el("test-connection").textContent = "测试中…";
     showToast("正在测试 WebDAV 写入和校验…", "pending");
   } else {
     el("save").textContent = "正在保存…";
-    showToast(`正在保存${NAMES[mode]}设置…`, "pending");
+    showToast(`正在保存${saveLabel}设置…`, "pending");
   }
   for (const control of document.querySelectorAll(
     "#form fieldset, [data-mode]",
@@ -1367,7 +1633,7 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
       archivesCache.webdav = null;
     }
     drawForm();
-    showToast(`${NAMES[mode]}设置已保存`, "success");
+    showToast(`${saveLabel}设置已保存`, "success");
   } catch (err) {
     showToast(
       `${testing ? "连接测试" : "保存"}失败：${err.message || "请稍后重试。"}`,
@@ -1381,12 +1647,18 @@ el("test-connection").onclick = el("form").onsubmit = async (event) => {
     )) {
       control.disabled = false;
     }
+    el("plan-section").disabled = mode === "notify";
+    el("retention-section").disabled = mode === "notify";
+    el("scope-section").disabled = mode === "notify";
     el("remote").disabled = mode !== "webdav";
+    el("notify-mode-section").disabled = mode !== "notify";
+    el("notify-targets-section").disabled = mode !== "notify";
     el("test-connection").disabled = false;
     el("test-connection").textContent = "测试连接";
+    el("test-notify").disabled = false;
     el("discard-draft").disabled = false;
     el("save").disabled = false;
-    el("save").textContent = `保存${NAMES[mode]}设置`;
+    el("save").textContent = `保存${saveLabel}设置`;
   }
   refresh().catch((err) => showToast(`仪表盘刷新失败：${err.message}`, "error"));
 };

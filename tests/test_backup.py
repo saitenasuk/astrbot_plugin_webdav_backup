@@ -695,3 +695,98 @@ class BackupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(c.startswith('event: progress\n') for c in received))
         await stream.aclose()
         self.assertEqual(len(self.bot._subscribers), 0)
+
+    async def test_temp_size_measurement(self):
+        (self.data / 'temp' / '__pycache__').mkdir()
+        (self.data / 'temp' / '__pycache__' / 'ignored.pyc').write_bytes(b'x' * 50)
+        (self.data / 'temp' / 'skip.pyc').write_bytes(b'y' * 30)
+        (self.data / 'temp' / 'nested').mkdir()
+        (self.data / 'temp' / 'nested' / 'voice.ogg').write_bytes(b'12345')
+
+        res = await self.bot.temp_size()
+        self.assertEqual(res.status_code, 200)
+        body = json.loads(res.body)
+        self.assertTrue(body['exists'])
+        # Includes media.jpg (9 bytes) + nested/voice.ogg (5 bytes), excludes .pyc/__pycache__
+        self.assertEqual(body['files'], 2)
+        self.assertEqual(body['size'], 14)
+
+        for item in sorted((self.data / 'temp').rglob('*'), reverse=True):
+            if item.is_file():
+                item.unlink()
+            else:
+                item.rmdir()
+        (self.data / 'temp').rmdir()
+        missing = json.loads((await self.bot.temp_size()).body)
+        self.assertEqual(missing, {'exists': False, 'size': 0, 'files': 0})
+
+    async def test_notification_settings_delivery_test_and_command(self):
+        self.bot.context.send_message = AsyncMock(return_value=True)
+        umo = 'aiocqhttp:GroupMessage:123456'
+
+        # Reject invalid notify_mode or malformed UMO
+        for bad in (
+            {'notify_mode': 'invalid'},
+            {'notify_targets': ['not-a-umo']},
+            {'notify_targets': ['aiocqhttp:UnknownType:123']},
+        ):
+            with self.subTest(bad=bad), patch.object(
+                plugin, 'request', SimpleNamespace(json=AsyncMock(return_value=bad))
+            ):
+                self.assertEqual((await self.bot.settings()).status_code, 400)
+
+        # Save valid notification settings (deduplicated)
+        with patch.object(
+            plugin,
+            'request',
+            SimpleNamespace(
+                json=AsyncMock(
+                    return_value={
+                        'notify_mode': 'failure',
+                        'notify_targets': [umo, umo],
+                    }
+                )
+            ),
+        ):
+            self.assertEqual((await self.bot.settings()).status_code, 200)
+        self.assertEqual(self.config['notify_targets'], [umo])
+
+        # In failure mode: success does not notify, failure does notify
+        await self.bot._send_backup_notification(
+            {'mode': 'local', 'trigger': 'schedule', 'ok': True, 'size': 2048, 'duration_ms': 1200}
+        )
+        self.bot.context.send_message.assert_not_awaited()
+
+        await self.bot._send_backup_notification(
+            {'mode': 'webdav', 'trigger': 'schedule', 'ok': False, 'error': 'WebDAV PUT 返回 HTTP 403'}
+        )
+        self.bot.context.send_message.assert_awaited_once()
+        sent_umo, sent_chain = self.bot.context.send_message.call_args.args
+        self.assertEqual(sent_umo, umo)
+        self.assertIn('HTTP 403', sent_chain.get_plain_text())
+
+        # Test notification endpoint
+        self.bot.context.send_message.reset_mock()
+        with patch.object(
+            plugin,
+            'request',
+            SimpleNamespace(json=AsyncMock(return_value={'targets': [umo]})),
+        ):
+            res = await self.bot.test_notification()
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(json.loads(res.body)['sent'], 1)
+
+        # Admin command add / list / mode / del
+        ev = SimpleNamespace(
+            unified_msg_origin='telegram:FriendMessage:999',
+            plain_result=lambda msg: msg,
+        )
+        out = [m async for m in self.bot.cmd_backup_notify(ev, 'add')]
+        self.assertIn('已将当前会话加入', out[0])
+        self.assertIn('telegram:FriendMessage:999', self.config['notify_targets'])
+        out = [m async for m in self.bot.cmd_backup_notify(ev, 'mode', 'all')]
+        self.assertIn('成功 & 失败', out[0])
+        self.assertEqual(self.config['notify_mode'], 'all')
+        out = [m async for m in self.bot.cmd_backup_notify(ev, 'del')]
+        self.assertIn('移出', out[0])
+        self.assertNotIn('telegram:FriendMessage:999', self.config['notify_targets'])
